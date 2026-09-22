@@ -2,8 +2,6 @@
 receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in config.yaml (see website docs)."""
 
 import asyncio
-import base64
-import datetime as _dt
 import email as email_lib
 from contextlib import contextmanager, suppress
 import imaplib
@@ -70,110 +68,6 @@ def _esecret_bool(name: str, default: bool = False) -> bool:
     return is_truthy_value(raw, default=default) if (raw := str(_get_secret(name, "")).strip()) else default
 
 
-# --- Gmail XOAUTH2 (re-applied 2026-09-19 after upstream refactor wiped the patch;
-# --- see skill email-gateway-oauth. Password fallback stays for non-Google accounts.) ---
-
-_GMAIL_TOKEN_PATH = os.path.expanduser("~/.hermes/google_token.json")
-
-
-def _gmail_oauth_access_token(address: str) -> Optional[str]:
-    """Load (and if needed refresh) the Gmail OAuth access token for *address*.
-
-    Returns None whenever XOAUTH2 cannot apply, so callers fall back to password.
-    Token file is google-auth shape: access token in ``token``, ISO-8601 ``expiry``.
-    """
-    import json as _json
-    import time as _time
-    import urllib.parse as _up
-    import urllib.request as _ur
-    log = logging.getLogger(__name__)
-    try:
-        tok = _json.load(open(_GMAIL_TOKEN_PATH))
-    except Exception:
-        return None
-    if not tok.get("refresh_token"):
-        return None
-    acct = (tok.get("account") or "").strip().lower()
-    if acct and address.strip().lower() != acct:
-        return None  # account guard: token is not for this mailbox
-
-    def _fresh() -> Optional[str]:
-        exp = tok.get("expiry")
-        left = -1.0
-        if isinstance(exp, str):
-            try:
-                dt = _dt.datetime.fromisoformat(exp.replace("Z", "+00:00"))
-                left = (dt - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
-            except ValueError:
-                left = -1.0
-        elif exp is not None:
-            left = float(exp) - _time.time()
-        if left > 300 and tok.get("token"):
-            return tok["token"]
-        if not tok.get("client_id"):
-            return tok.get("token")
-        body = _up.urlencode({
-            "client_id": tok["client_id"],
-            "client_secret": tok.get("client_secret", ""),
-            "refresh_token": tok["refresh_token"],
-            "grant_type": "refresh_token",
-        }).encode()
-        try:
-            req = _ur.Request(tok.get("token_uri", "https://oauth2.googleapis.com/token"), data=body)
-            new = _json.load(_ur.urlopen(req, timeout=30))
-        except Exception as e:  # expired/revoked grant etc. — password fallback engages
-            log.warning("[Email] Gmail token refresh failed: %s", e)
-            return None
-        tok["token"] = new["access_token"]
-        tok["expiry"] = (_dt.datetime.now(_dt.timezone.utc)
-                         + _dt.timedelta(seconds=int(new.get("expires_in", 3600)) - 60)).isoformat()
-        try:
-            tmp = _GMAIL_TOKEN_PATH + ".tmp"
-            with open(tmp, "w") as fh:
-                _json.dump(tok, fh, indent=2)
-            os.replace(tmp, _GMAIL_TOKEN_PATH)
-        except OSError:
-            pass  # unwritable file: still use the fresh token in-process
-        return tok["token"]
-
-    try:
-        return _fresh()
-    except Exception:
-        return None
-
-
-def _xoauth2_sasl(address: str, access_token: str) -> bytes:
-    return f"user={address}\x01auth=Bearer {access_token}\x01\x01".encode()
-
-
-def _sasl_cb(address: str, token: str, as_str: bool = False):
-    """Auth callback. imaplib wants bytes; smtplib encodes+wraps itself and wants str."""
-    sasl = _xoauth2_sasl(address, token)
-    return (lambda *_: sasl.decode()) if as_str else (lambda *_: sasl)
-
-
-def _imap_login(imap: "imaplib.IMAP4", address: str, password: str) -> None:
-    token = _gmail_oauth_access_token(address)
-    if token:
-        try:
-            imap.authenticate("XOAUTH2", _sasl_cb(address, token))
-            return
-        except imaplib.IMAP4.error as e:
-            logging.getLogger(__name__).info("[Email] XOAUTH2 IMAP rejected (%s); trying password", e)
-    imap.login(address, password)
-
-
-def _smtp_login(smtp: "smtplib.SMTP", address: str, password: str) -> None:
-    token = _gmail_oauth_access_token(address)
-    if token:
-        try:
-            smtp.auth("XOAUTH2", _sasl_cb(address, token, as_str=True))
-            return
-        except smtplib.SMTPAuthenticationError as e:
-            logging.getLogger(__name__).info("[Email] XOAUTH2 SMTP rejected (%s); trying password", e)
-    smtp.login(address, password)
-
-
 def _normalize_security(value: Any, default: str = "tls") -> str:
     """Map to ``tls`` | ``starttls`` | ``plain``; unknown values warn and fall back to *default* (a typo never downgrades to plaintext)."""
     raw = str(value or "").strip().lower().replace("-", "").replace("_", "")
@@ -223,6 +117,84 @@ def _create_ipv4_connection(host: str, port: int, timeout: float, source_address
             last_error = exc
             sock.close()
     raise last_error if last_error is not None else OSError(f"No IPv4 address found for {host}:{port}")
+
+
+# --- Gmail XOAUTH2 (email-gateway-oauth skill; re-added 2026-09-18 after refactor de114b3af1 wiped it) ---
+def _gmail_oauth_access_token(address: str) -> Optional[str]:
+    """Access token from ~/.hermes/google_token.json (google-auth shape: 'token' + ISO 'expiry'),
+    refreshed via refresh_token when <5 min remain (atomic write-back so gws/dunning/jobs-board
+    consumers keep working). Returns None unless the token's 'account' matches *address* —
+    callers then fall back to password auth."""
+    import json as _json
+    import urllib.parse as _uparse
+    import urllib.request as _ureq
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    try:
+        token_path = os.path.expanduser("~/.hermes/google_token.json")
+        with open(token_path) as fh:
+            tok = _json.load(fh)
+        if (tok.get("account") or "").lower() != (address or "").lower():
+            return None
+        if not tok.get("token") or not tok.get("refresh_token") or not tok.get("client_id"):
+            return None
+        needs_refresh = True
+        expiry = tok.get("expiry")
+        if expiry:
+            try:
+                exp = _dt.fromisoformat(str(expiry).replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=_tz.utc)
+                needs_refresh = (exp - _dt.now(_tz.utc)).total_seconds() < 300
+            except ValueError:
+                pass
+        if needs_refresh:
+            payload = _uparse.urlencode({
+                "client_id": tok["client_id"],
+                "client_secret": tok.get("client_secret", ""),
+                "refresh_token": tok["refresh_token"],
+                "grant_type": "refresh_token",
+            }).encode()
+            req = _ureq.Request(tok.get("token_uri") or "https://oauth2.googleapis.com/token", data=payload)
+            with _ureq.urlopen(req, timeout=30) as resp:
+                fresh = _json.load(resp)
+            tok["token"] = fresh["access_token"]
+            tok["expiry"] = (_dt.now(_tz.utc) + _td(seconds=int(fresh.get("expires_in", 3600)) - 60)).isoformat()
+            tmp = token_path + ".tmp-email-adapter"
+            with open(tmp, "w") as fh:
+                _json.dump(tok, fh, indent=2)
+            os.replace(tmp, token_path)
+        return tok["token"]
+    except Exception:
+        return None
+
+
+def _xoauth2_sasl(user: str, access_token: str) -> str:
+    """SASL XOAUTH2 string: user=<email>\\x01auth=Bearer <token>\\x01\\x01"""
+    return f"user={user}\x01auth=Bearer {access_token}\x01\x01"
+
+
+def _imap_login(imap: imaplib.IMAP4, address: str, password: str) -> None:
+    """IMAP login preferring Gmail XOAUTH2; password fallback (imaplib wants bytes)."""
+    tok = _gmail_oauth_access_token(address)
+    if tok:
+        try:
+            imap.authenticate("XOAUTH2", lambda _=None: _xoauth2_sasl(address, tok).encode())
+            return
+        except Exception as exc:
+            logger.warning("[Email] XOAUTH2 IMAP auth failed (%s); falling back to password", exc)
+    imap.login(address, password)
+
+
+def _smtp_login(smtp: smtplib.SMTP, address: str, password: str) -> None:
+    """SMTP login preferring Gmail XOAUTH2; password fallback (smtplib.auth wants str)."""
+    tok = _gmail_oauth_access_token(address)
+    if tok:
+        try:
+            smtp.auth("XOAUTH2", lambda _=None: _xoauth2_sasl(address, tok))
+            return
+        except Exception as exc:
+            logger.warning("[Email] XOAUTH2 SMTP auth failed (%s); falling back to password", exc)
+    smtp.login(address, password)
 
 
 class _IPv4SMTP(smtplib.SMTP):
@@ -890,7 +862,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         for key, value in (("From", address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
             msg[key] = value
         server = _open_smtp(smtp_host, smtp_port, smtp_security, _tls_context(smtp_tls_verify, smtp_host), smtplib.SMTP, smtplib.SMTP_SSL)
-        server.login(address, password)
+        _smtp_login(server, address, password)
         server.send_message(msg)
         server.quit()
         return {"success": True, "platform": "email", "chat_id": chat_id}
