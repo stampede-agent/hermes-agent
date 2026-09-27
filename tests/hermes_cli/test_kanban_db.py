@@ -1596,6 +1596,157 @@ def test_resolve_hermes_argv_module_actually_runs():
 
 
 # ---------------------------------------------------------------------------
+# Module-form worker PYTHONPATH restoration — #115104
+#
+# build_subprocess_env strips Hermes-owned PYTHONPATH entries (repo root,
+# runtime site-packages) so a DIFFERENT-version child Python can never load
+# this backend's C extensions. On a managed-python gateway _resolve_hermes_argv
+# falls back to the module form (sys.executable -m hermes_cli.main) — the child
+# IS this interpreter, and the stripped entries were its only import path:
+# every worker died with `ModuleNotFoundError: No module named 'hermes_cli'`
+# before its first heartbeat. _restore_module_form_pythonpath re-injects the
+# dispatcher's own PYTHONPATH after the sanitizer, for module-form argv only.
+# ---------------------------------------------------------------------------
+
+
+def test_restore_module_form_pythonpath_merges_and_gates(monkeypatch):
+    """Module-form argv gets the parent's PYTHONPATH back (kept entries first,
+    parent deduplicated); path-form argv leaves the sanitized env untouched."""
+    sep = os.pathsep
+    monkeypatch.setenv("PYTHONPATH", sep.join(["/owned/repo", "/owned/repo", "/owned/sp"]))
+    module_cmd = [sys.executable, "-m", "hermes_cli.main", "--cli", "chat"]
+
+    # Entries the sanitizer kept (non-Hermes) stay ahead of the restored ones.
+    env = {"PYTHONPATH": "/kept/user"}
+    kbd._restore_module_form_pythonpath(module_cmd, env)
+    assert env["PYTHONPATH"].split(sep) == ["/kept/user", "/owned/repo", "/owned/sp"]
+
+    # Fully stripped env: restored verbatim, with the parent's duplicate
+    # repo root collapsed (real launchers emit it twice).
+    env = {}
+    kbd._restore_module_form_pythonpath(module_cmd, env)
+    assert env["PYTHONPATH"] == sep.join(["/owned/repo", "/owned/sp"])
+
+    # Path-form argv is a self-contained console script — never re-inject.
+    env = {"PYTHONPATH": "/kept/user"}
+    kbd._restore_module_form_pythonpath(["/usr/local/bin/hermes", "--cli", "chat"], env)
+    assert env == {"PYTHONPATH": "/kept/user"}
+
+    # No parent PYTHONPATH (e.g. an editable-install dispatcher): nothing to do.
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    env = {}
+    kbd._restore_module_form_pythonpath(module_cmd, env)
+    assert env == {}
+
+
+def test_module_form_spawn_env_boots_pythonpath_dependent_child(monkeypatch, tmp_path):
+    """End-to-end through the REAL sanitizer: a module-form worker's spawn env
+    must import a module reachable only through the dispatcher's PYTHONPATH,
+    and the same env must stay stripped for path-form argv.
+
+    Simulates the managed-python gateway without depending on one: a probe dir
+    is declared Hermes-owned so build_subprocess_env strips it exactly like the
+    repo root / runtime site-packages in production (#115104).
+    """
+    from tools.environments import local
+    from tools.environments.local import build_subprocess_env
+
+    owned = tmp_path / "owned_root"
+    owned.mkdir()
+    (owned / "spawn_probe_mod.py").write_text("VALUE = 'probe-ok'\n", encoding="utf-8")
+    neutral = tmp_path / "neutral_cwd"
+    neutral.mkdir()
+
+    monkeypatch.setattr(local, "_hermes_repo_root_aliases", (owned,))
+    monkeypatch.setattr(local, "_hermes_site_packages", [])
+    monkeypatch.setenv("PYTHONPATH", str(owned))
+    # Guard neutrality (tests/home_io_guard.py): pre-cache the hermes-bin lookup
+    # (resolving it would stat the runtime venv's bin under the REAL home) and
+    # point the pm install-state probe at tmp so no runtime facts are read.
+    monkeypatch.setattr(local, "_HERMES_BIN_DIR", None)
+    import pm.environments
+    monkeypatch.setattr(pm.environments, "install_state_dir", lambda _root: tmp_path / "pm-state")
+
+    env = build_subprocess_env(scrub_secrets=True)
+    assert str(owned) not in env.get("PYTHONPATH", "").split(os.pathsep), (
+        "test setup: the sanitizer should have stripped the owned entry"
+    )
+    probe = [sys.executable, "-c", "import spawn_probe_mod; print(spawn_probe_mod.VALUE)"]
+
+    # Red leg: the sanitized env alone cannot boot the child — the #115104 crash.
+    r = subprocess.run(probe, env=env, cwd=str(neutral), capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "spawn_probe_mod" in r.stderr
+
+    # Green leg: the module-form restoration brings the import path back.
+    kbd._restore_module_form_pythonpath([sys.executable, "-m", "hermes_cli.main"], env)
+    r = subprocess.run(probe, env=env, cwd=str(neutral), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.strip() == "probe-ok", r.stderr
+
+    # Path-form argv keeps the sanitized env — the child stays unbootable,
+    # proving the injection is gated on the module form and not blanket.
+    env2 = build_subprocess_env(scrub_secrets=True)
+    kbd._restore_module_form_pythonpath(["/usr/local/bin/hermes", "--cli"], env2)
+    r = subprocess.run(probe, env=env2, cwd=str(neutral), capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "spawn_probe_mod" in r.stderr
+
+
+def test_module_form_worker_help_exits_zero_under_scrubbed_env(monkeypatch, tmp_path):
+    """The card's regression assertion (#115104): on a PYTHONPATH-dependent
+    interpreter, a scrubbed spawn env must fail to boot the real CLI, and the
+    same env after the module-form restoration must run
+    ``python -m hermes_cli.main --help`` to exit 0.
+
+    Skipped on self-contained runtimes (venv/editable installs, or hosts where
+    an interim .pth pins the tree into the interpreter): there the production
+    failure is unreachable and both legs would be vacuous.
+    """
+    from tools.environments import local
+    from tools.environments.local import build_subprocess_env
+
+    neutral = tmp_path / "cwd"
+    neutral.mkdir()
+    # Guard neutrality (tests/home_io_guard.py): pre-cache the hermes-bin lookup
+    # (resolving it would stat the runtime venv's bin under the REAL home) and
+    # point the pm install-state probe at tmp so no runtime facts are read.
+    # The repo-root aliases stay REAL — the strip must fire on its own.
+    monkeypatch.setattr(local, "_HERMES_BIN_DIR", None)
+    import pm.environments
+    monkeypatch.setattr(pm.environments, "install_state_dir", lambda _root: tmp_path / "pm-state")
+    # Dependency probe with PYTHONPATH (-E) and the cwd path entry (-P) both
+    # disabled: rc 0 means the interpreter finds hermes_cli on its own.
+    probe = subprocess.run(
+        [sys.executable, "-E", "-P", "-c", "import hermes_cli.main"],
+        cwd=str(neutral), capture_output=True, timeout=180,
+    )
+    if probe.returncode == 0:
+        pytest.skip("interpreter imports hermes_cli without PYTHONPATH (self-contained runtime)")
+
+    repo_root = str(Path(kbd.__file__).resolve().parents[1])
+    entries = [e for e in os.environ.get("PYTHONPATH", "").split(os.pathsep) if e]
+    if repo_root not in entries:
+        entries.insert(0, repo_root)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(entries))
+
+    env = build_subprocess_env(scrub_secrets=True)
+    assert repo_root not in env.get("PYTHONPATH", "").split(os.pathsep), (
+        "test setup: the sanitizer should have stripped the repo root"
+    )
+    argv = [sys.executable, "-m", "hermes_cli.main", "--help"]
+
+    # Red leg: the production crash — ModuleNotFoundError before any heartbeat.
+    r = subprocess.run(argv, env=env, cwd=str(neutral), capture_output=True, text=True, timeout=180)
+    assert r.returncode != 0 and "hermes_cli" in r.stderr, (
+        f"expected the #115104 module-lookup failure, got rc={r.returncode}"
+    )
+
+    # Green leg: restored, the exact card assertion — `--help` exits 0.
+    kbd._restore_module_form_pythonpath(argv, env)
+    assert repo_root in env["PYTHONPATH"].split(os.pathsep)
+    r = subprocess.run(argv, env=env, cwd=str(neutral), capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, f"`--help` under the restored env failed: {r.stderr[:400]!r}"
+
+
+# ---------------------------------------------------------------------------
 # task_age — guard against corrupt timestamp values
 #
 # The Task dataclass declares ``created_at: int`` but rows come from sqlite

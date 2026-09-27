@@ -2473,6 +2473,37 @@ def _module_hermes_argv() -> list[str]:
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
+def _restore_module_form_pythonpath(cmd: list[str], env: dict) -> None:
+    """Re-inject the dispatcher's PYTHONPATH for a module-form worker (#115104).
+
+    ``build_subprocess_env`` strips Hermes-owned PYTHONPATH entries so a
+    DIFFERENT-version child Python can never load this backend's C extensions
+    (``tools/environments/local_pythonpath.py``). A module-form worker
+    (``sys.executable -m hermes_cli.main`` — what the resolver picks when no
+    self-contained ``hermes`` shim exists, e.g. a managed-python gateway) IS
+    this interpreter, and those entries were its only import path to
+    ``hermes_cli`` and the runtime's site-packages: every spawn died with
+    ``ModuleNotFoundError: No module named 'hermes_cli'`` before its first
+    heartbeat. Restore the parent's PYTHONPATH AFTER the sanitizer — the same
+    rationale as cron's ``pin_hermes_tree_on_pythonpath``
+    (``cron/scheduler_worker_env.py``), which pins only the repo root because
+    ``-m cron.scheduler`` needs nothing else; a full CLI boot also needs the
+    dependency tree. Entries the sanitizer kept stay first; the parent's are
+    deduplicated (launchers can repeat the repo root). Path-form argv is
+    self-contained (console script with its own shebang/venv) and untouched.
+    """
+    if cmd[:3] != _module_hermes_argv():
+        return
+    parent = os.environ.get("PYTHONPATH")
+    if not parent:
+        return
+    kept = [e for e in env.get("PYTHONPATH", "").split(os.pathsep) if e]
+    merged = kept + [
+        e for e in dict.fromkeys(parent.split(os.pathsep)) if e and e not in kept
+    ]
+    env["PYTHONPATH"] = os.pathsep.join(merged)
+
+
 def _absolute_hermes_path(path: str) -> str:
     """Return an absolute filesystem path for a resolved Hermes shim."""
     expanded = os.path.expanduser(path)
@@ -2896,6 +2927,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    # A module-form worker IS this interpreter: hand it back the import path
+    # the sanitizer stripped above, or it dies at module lookup before its
+    # first heartbeat (#115104). Path-form argv is self-contained; no-op.
+    _restore_module_form_pythonpath(cmd, env)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
