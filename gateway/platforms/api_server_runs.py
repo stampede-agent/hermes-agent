@@ -934,6 +934,28 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             loop.call_soon_threadsafe(run.put_event, _run_event(
                 run_id, "message.interim", text=text, already_streamed=bool(already_streamed)))
 
+    def _reasoning_cb(text: Optional[str]) -> None:
+        # Structured reasoning deltas, same source as the chat-completions route (#99552).
+        # Without this a run showed nothing between ``route.decided`` and the first answer
+        # token (10-20s per step on a cold prefill), and the lossy ``reasoning.available``
+        # preview only landed after the step was already over.
+        if not text or run_id not in self._run_streams:
+            return
+        with suppress(Exception):
+            loop.call_soon_threadsafe(run.put_event, _run_event(run_id, "reasoning.delta", text=text))
+
+    def _status_cb(kind: Any, message: Optional[str] = None) -> None:
+        # Lifecycle status (provider wait, recovery countdown, fallback switch, compression) so a
+        # client can say WHY the stream is quiet instead of showing a dead spinner.
+        if run_id not in self._run_streams:
+            return
+        text = _redact_api_error_text(message if message is not None else kind or "").strip()
+        if not text:
+            return
+        with suppress(Exception):
+            loop.call_soon_threadsafe(run.put_event, _run_event(
+                run_id, "run.status", kind=str(kind), text=text))
+
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
         extra = extra or {}
@@ -960,7 +982,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+                interim_assistant_callback=_interim_cb, reasoning_callback=_reasoning_cb,
+                status_callback=_status_cb, **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
