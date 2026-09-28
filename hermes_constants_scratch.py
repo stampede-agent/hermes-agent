@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -164,6 +165,48 @@ def release_git_worktrees(repos: set[str]) -> None:
             logger.debug("git worktree prune in %s failed: %s", repo, exc)
 
 
+def _prune_guard_script() -> "Path | None":
+    """Artefact-registry prune guard (fleet artefacts card 3/5, item 4).
+
+    Lives outside the harness so hosts without the artefacts stack simply have
+    no script and prune behaves exactly as before.  Override for tests via
+    ``HERMES_ARTEFACT_PRUNE_GUARD``."""
+    override = os.environ.get("HERMES_ARTEFACT_PRUNE_GUARD")
+    candidate = Path(override) if override else (
+        Path.home() / ".hermes/scripts/artefacts/prune_guard.py")
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _run_prune_guard(doomed: "list[Path]") -> bool:
+    """Offer every media file in *doomed* entries to the artefact registry
+    (register-or-rescue) before deletion.  Returns True when every entry is
+    safe to delete.  Fail-safe: a non-zero verdict, crash, or timeout returns
+    False and the caller skips this prune pass entirely — losing a prune cycle
+    is cheap, losing an unregistered artefact is not."""
+    script = _prune_guard_script()
+    if script is None:
+        return True
+    payload = "\0".join(str(e) for e in doomed).encode("utf-8", "replace")
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--paths-stdin"],
+            input=payload, capture_output=True, timeout=600.0, check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        logger.warning("scratch prune: artefact guard failed (%s); skipping prune pass (fail-safe)", exc)
+        return False
+    if proc.returncode == 0:
+        return True
+    tail = (proc.stdout or b"").decode("utf-8", "replace")[-400:]
+    logger.warning(
+        "scratch prune: artefact guard verdict UNSAFE (exit %s); skipping prune pass (fail-safe). %s",
+        proc.returncode, tail)
+    return False
+
+
 def prune_idle_entries(root: Path, max_idle_hours: float, skip_names: frozenset[str]) -> int:
     """Delete top-level entries of *root* with no write anywhere in their subtree for
     *max_idle_hours*, reaping processes and worktree registrations rooted in them first.
@@ -182,6 +225,8 @@ def prune_idle_entries(root: Path, max_idle_hours: float, skip_names: frozenset[
         logger.debug("scratch prune: process reap skipped: %s", exc)
     if not doomed:
         return 0
+    if not _run_prune_guard(doomed):
+        return 0   # guard could not preserve everything: skip this pass
     repos: set[str] = set()
     removed = 0
     for entry in doomed:
