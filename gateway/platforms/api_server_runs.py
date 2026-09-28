@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -501,6 +501,10 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    # [runs-timing] (kanban t_5936f60e): perf_counter at admission; _execute_run logs
+    # admit_lag_ms/agent_build_ms/turn_ms so fleet first-token regressions can be
+    # attributed without replaying probes. Same-process clock only — never serialized.
+    admitted_at: float = field(default_factory=time.perf_counter)
 
     @property
     def approval_session_key(self) -> str:
@@ -917,6 +921,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
     _run_started_at = time.perf_counter()
+    # [runs-timing] (kanban t_5936f60e): phase timings logged once per run in the
+    # finally block — admit_lag (loop scheduling under load), agent_build (the
+    # per-turn rebuild), turn (whole agent turn). -1 turn_ms = never finished.
+    _timing: Dict[str, float] = {"admit_lag_ms": (_run_started_at - run.admitted_at) * 1000.0}
 
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
@@ -979,15 +987,19 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
+        _t_agent = time.perf_counter()
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 interim_assistant_callback=_interim_cb, reasoning_callback=_reasoning_cb,
                 status_callback=_status_cb, **run.agent_kwargs)
+        _timing["agent_build_ms"] = (time.perf_counter() - _t_agent) * 1000.0
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
+        _t_turn = time.perf_counter()
         result, usage, served_runtime = await _submit_api_worker(
             loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        _timing["turn_ms"] = (time.perf_counter() - _t_turn) * 1000.0
         # Publish request metrics (daily counters + latency) with each completed run (#52323).
         self._record_api_metrics(usage, time.perf_counter() - _run_started_at)
         if not isinstance(result, dict):
@@ -1018,6 +1030,11 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         logger.exception("[api_server] run %s failed", run_id)
         _finish("failed", error=_redact_api_error_text(exc))
     finally:
+        with suppress(Exception):
+            logger.info(
+                "[runs-timing] run=%s admit_lag_ms=%.0f agent_build_ms=%.0f turn_ms=%.0f",
+                run_id, _timing.get("admit_lag_ms", -1.0), _timing.get("agent_build_ms", -1.0),
+                _timing.get("turn_ms", -1.0))
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
