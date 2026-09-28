@@ -430,6 +430,69 @@ def _auth_headers(api_key: object = "") -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+# ── Endpoint key resolution (kanban t_5936f60e WS6) ─────────────────────────
+# Metadata probes (pricing, context length, server type) frequently reach
+# authenticated endpoints with no api_key plumbed by the caller — anonymous
+# probes against the fleet router logged a 401 + traceback for every fresh
+# hermes process (the "GET /v1/models every ~5 min" bursts as kanban workers
+# spawned). The local config nearly always carries the key for endpoints it
+# configures itself (model aliases, provider entries): resolve it by origin so
+# probes authenticate instead of 401-noising the router — and key-less
+# endpoints (plain local vLLM/Ollama) keep working: the lookup just returns "".
+_config_key_memo: Dict[str, Tuple[float, str]] = {}
+_CONFIG_KEY_TTL = 300.0
+
+
+def _origin_key(base_url: str) -> str:
+    p = urlparse(base_url or "")
+    host = (p.hostname or "").lower()
+    if host in ("localhost", "::1"):
+        host = "127.0.0.1"
+    port = p.port or {"http": 80, "https": 443}.get(p.scheme, 0)
+    return f"{p.scheme}://{host}:{port}" if p.scheme and host else ""
+
+
+def _config_api_key_for_base_url(base_url: str) -> str:
+    """api_key configured locally for this endpoint origin ("" when unknown).
+
+    Scans model.aliases.* and provider entries for a matching scheme+host+port
+    with a non-empty api_key. Result memoized per origin for _CONFIG_KEY_TTL.
+    """
+    origin = _origin_key(base_url)
+    if not origin:
+        return ""
+    now = time.monotonic()
+    hit = _config_key_memo.get(origin)
+    if hit and (now - hit[0]) < _CONFIG_KEY_TTL:
+        return hit[1]
+    key = ""
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
+        entries: List[Any] = []
+        aliases = (config.get("model") or {}).get("aliases")
+        if isinstance(aliases, dict):
+            entries.extend(aliases.values())
+        for section in ("providers", "custom_providers"):
+            block = config.get(section)
+            if isinstance(block, dict):
+                entries.extend(block.values())
+            elif isinstance(block, list):
+                entries.extend(block)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_key = str(entry.get("api_key") or "").strip()
+            entry_url = str(entry.get("base_url") or "").strip()
+            if entry_key and entry_url and _origin_key(entry_url) == origin:
+                key = entry_key
+                break
+    except Exception:
+        logger.debug("config api_key lookup failed for %s", base_url, exc_info=True)
+    _config_key_memo[origin] = (now, key)
+    return key
+
+
 def _is_custom_endpoint(base_url: str) -> bool:
     normalized = _normalize_base_url(base_url)
     return bool(normalized) and not base_url_host_matches(normalized, "openrouter.ai")
@@ -718,6 +781,10 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     import httpx
     # IPv4-resolve BEFORE deriving server/LM Studio URLs and the cache lookup, so localhost and 127.0.0.1 share a cache entry.
     normalized = _localhost_to_ipv4(_normalize_base_url(base_url))
+    if not api_key:
+        # WS6 (t_5936f60e): authenticated local routers answer anonymous
+        # waterfall probes with 401s; use the configured key when we have one.
+        api_key = _config_api_key_for_base_url(normalized)
     # A hosted provider (api.openai.com, api.anthropic.com, ...) never runs Ollama/LM Studio/llama.cpp/vLLM:
     # skip the waterfall so egress logs do not fill with 404s for /api/tags, /v1/props, /version (#61421).
     # Local addresses are never in that table, and ollama.com is the one hosted host that does speak
@@ -1029,6 +1096,10 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
     if not normalized or base_url_host_matches(normalized, "openrouter.ai"):
         return {}
     local = is_local_endpoint(normalized)
+    if not api_key:
+        # WS6 (t_5936f60e): probe with the configured key for this origin
+        # instead of anonymously — 401 noise on authenticated local routers.
+        api_key = _config_api_key_for_base_url(normalized)
     memo_key = _endpoint_memo_key(normalized, api_key)
     if not force_refresh:
         cached = _endpoint_model_metadata_cache.get(memo_key)
@@ -2042,6 +2113,10 @@ def _resolve_bedrock_context_length(model: str, base_url: str) -> Optional[int]:
 
 def _resolve_custom_endpoint_context_length(model: str, base_url: str, api_key: str, provider: str) -> int:
     """Steps 2-3 for a truly custom endpoint: /models, local probes, Ollama /api/show, catalog, default."""
+    if not api_key:
+        # WS6 (t_5936f60e): never probe an endpoint we hold a configured key
+        # for anonymously — the router answers with 401 tracebacks.
+        api_key = _config_api_key_for_base_url(base_url)
     context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
     if context_length is not None:
         return context_length
