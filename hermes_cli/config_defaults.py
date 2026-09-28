@@ -1300,6 +1300,14 @@ DEFAULT_CONFIG = {
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
         "provider": "",
+        # Progressive disclosure for provider tool surfaces (kanban t_eb99c448): keep only
+        # `eager_tools` attached to the model's tool array; the rest stay discoverable and
+        # invocable through the tool_search bridge (requires tools.tool_search enabled).
+        # Off by default = the classic fully-eager provider surface.
+        "provider_tool_deferral": {
+            "enabled": False,
+            "eager_tools": ["mnemosyne_recall", "mnemosyne_remember"],
+        },
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
@@ -1438,6 +1446,12 @@ DEFAULT_CONFIG = {
         # Resolved once when the agent's prompt is first built; missing/disabled names warn and
         # skip; HERMES_IGNORE_RULES suppresses the list like the other auto-injected context.
         "auto_load": [],
+        # Skills-index style in the system prompt (kanban t_eb99c448): "full" = name + full
+        # description; "trigger" = name + first-sentence trigger line; "names" = every category
+        # demoted to a names-only line. index_style_platforms scopes the style to specific
+        # platforms (e.g. ["api_server"] for the Fleet surface); empty list = all platforms.
+        "index_style": "full",
+        "index_style_platforms": [],
         # Substitute ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in SKILL.md content.
         "template_vars": True,
         # Pre-execute !`cmd` snippets in SKILL.md, inlining stdout (dates, git state...). Off:

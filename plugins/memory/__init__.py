@@ -389,6 +389,20 @@ class _ProviderCollector:
 
     def register_memory_provider(self, provider):
         self.provider = provider
+        # Publish the deferral discovery store (kanban t_eb99c448). The gateway loads
+        # providers through THIS activation path — without publication the bridge
+        # catalog/search and tool_call unwrap validation (both store-backed) never see
+        # provider tools in the gateway process, even though inject defers them.
+        # Mirrors PluginContext.register_memory_provider. Gated on _register_skills:
+        # inspecting an inactive provider must not leak its schemas into the store.
+        if not self._register_skills:
+            return
+        try:
+            from agent.memory_manager import register_provider_tool_defs
+            register_provider_tool_defs(provider.get_tool_schemas())
+        except Exception:
+            logger.debug("Memory provider '%s': tool-def publication skipped",
+                         self.name, exc_info=True)
 
     def register_skill(self, *args, **kwargs):
         """Forward skills to the plugin registry, tracking qualified name + path so

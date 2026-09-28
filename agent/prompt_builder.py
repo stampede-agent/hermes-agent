@@ -1274,11 +1274,15 @@ def _current_session_platform_hint() -> str:
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None, available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None, skills_dir_override: "Path | None" = None,
+    index_style: str = "full",
 ) -> str:
     """Compact skill index for the system prompt.
 
     External dirs (``skills.external_dirs``) are read-only and lose name collisions to local skills.
     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
+    ``index_style`` (skills.index_style config, kanban t_eb99c448): "full" renders name+description;
+    "trigger" trims each description to its first-sentence trigger line; "names" demotes EVERY
+    category to names-only. Deterministic per config → byte-stable prompt prefix for caching.
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
     """
@@ -1296,7 +1300,8 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs)
+            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs,
+            index_style=index_style)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1355,9 +1360,49 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
         skills_by_category.setdefault(category, []).append((fm, desc))
 
 
+def _compact_skill_desc(desc: str, cap: int = 140) -> str:
+    """First-sentence trigger line of a skill description (index_style="trigger").
+    Deterministic and whitespace-normalized so the prompt prefix stays byte-stable."""
+    d = " ".join(str(desc).split())
+    if len(d) <= cap:
+        return d
+    head = d[:cap]
+    for sep in (". ", "! ", "? ", "; ", " — ", " - "):
+        idx = head.find(sep)
+        if cap // 3 <= idx < cap - 1:
+            return head[:idx + 1].rstrip()
+    sp = head.rfind(" ")
+    if sp > cap // 2:
+        head = head[:sp]
+    return head.rstrip(" ,;:-")
+
+
+def resolve_skills_index_style(platform: "str | None") -> str:
+    """`skills.index_style` ("full"|"trigger"|"names") gated by `skills.index_style_platforms`
+    (empty = every platform of this profile). Fail-closed to "full" (kanban t_eb99c448)."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        cfg = load_config_readonly()
+        style = str(cfg_get(cfg, "skills", "index_style", default="full") or "full").strip().lower()
+        if style not in ("full", "trigger", "names"):
+            style = "full"
+        if style == "full":
+            return "full"
+        plats = cfg_get(cfg, "skills", "index_style_platforms", default=None)
+        if isinstance(plats, (list, tuple)) and plats:
+            allowed = {str(p).strip().lower() for p in plats if str(p).strip()}
+            p = getattr(platform, "value", platform)
+            if str(p or "").strip().lower() not in allowed:
+                return "full"
+        return style
+    except Exception:
+        return "full"
+
+
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
+    index_style: str = "full",
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list."""
     if not skills_by_category:
@@ -1365,11 +1410,19 @@ def _render_skills_index(
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
     demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
-    hidden_note = (
-        "\n(Categories marked [names only] are outside the current coding "
-        "context, so their descriptions are omitted — the skills work "
-        "normally and load with skill_view(name) as usual.)"
-    ) if demoted else ""
+    if index_style == "names":
+        # Operator-chosen compact index (skills.index_style): every category names-only.
+        demoted = frozenset(skills_by_category)
+        hidden_note = (
+            "\n(This index lists skill NAMES only to keep the prompt compact — the skills work "
+            "normally: load one with skill_view(name), or list categories/descriptions with skills_list.)"
+        ) if demoted else ""
+    else:
+        hidden_note = (
+            "\n(Categories marked [names only] are outside the current coding "
+            "context, so their descriptions are omitted — the skills work "
+            "normally and load with skill_view(name) as usual.)"
+        ) if demoted else ""
     # Don't name web_search when the session has no web tools (dangling reference).
     _basic_tools = "terminal" if available_tools is not None and "web_search" not in available_tools else "web_search or terminal"
     index_lines = []
@@ -1379,11 +1432,15 @@ def _render_skills_index(
             index_lines.append(f"  {category} [names only]: {', '.join(sorted({n for n, _ in entries}))}")
             continue
         cat_desc = category_descriptions.get(category, "")
+        if index_style == "trigger" and cat_desc:
+            cat_desc = _compact_skill_desc(cat_desc, 100)
         index_lines.append(f"  {category}: {cat_desc}" if cat_desc else f"  {category}:")
         seen = set()
         for name, desc in sorted(entries, key=lambda x: x[0]):  # stable: first entry per name wins
             if name not in seen:
                 seen.add(name)
+                if index_style == "trigger" and desc:
+                    desc = _compact_skill_desc(desc)
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
     from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, is_single_query_session
     if is_single_query_session():
@@ -1423,7 +1480,7 @@ def _oneshot_prompt_variant() -> bool:
 def _build_skills_system_prompt_inner(
     skills_dir: "Path", external_dirs: "list[Path]", available_tools: "set[str] | None",
     available_toolsets: "set[str] | None", compact_categories: "frozenset[str] | None",
-    project_dirs: "list[Path] | None" = None,
+    project_dirs: "list[Path] | None" = None, index_style: str = "full",
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
@@ -1434,7 +1491,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(),
+        _oneshot_prompt_variant(), str(index_style or "full"),
     )
     snapshot = _load_skills_snapshot(skills_dir)
     app_gated = snapshot is not None and any(
@@ -1497,7 +1554,8 @@ def _build_skills_system_prompt_inner(
         for cat, cat_desc in _read_category_descriptions(ext_dir, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
 
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools,
+                                  index_style=index_style)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

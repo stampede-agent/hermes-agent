@@ -259,7 +259,11 @@ def _tool_defs_cache_key(
 
     Covers every argument plus everything that changes the result without one:
     registry generation, config.yaml stat signature (dynamic schemas), kanban
-    context, profile scope. check_fn results are TTL-cached in the registry.
+    context, profile scope, and the memory-provider deferral store generation —
+    the provider registers its schemas on first agent init (after this cache may
+    already hold a pre-registration resolve), and the merged disclosure assembly
+    differs once the store is populated (kanban t_eb99c448). check_fn results are
+    TTL-cached in the registry.
     """
     profile_scope = check_fn_cache_scope()
     if profile_scope == CHECK_FN_CACHE_BYPASS:
@@ -270,11 +274,16 @@ def _tool_defs_cache_key(
         cfg_fp = file_signature(cfg_stat)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
+    try:
+        from agent.memory_manager import provider_defs_generation
+        provider_gen = provider_defs_generation()
+    except Exception:
+        provider_gen = 0
     return (
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
-        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope, provider_gen,
     )
 
 
@@ -533,6 +542,13 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+            # Deferred external memory-provider tools (memory.provider_tool_deferral,
+            # kanban t_eb99c448) join the same disclosure assembly — the bridge
+            # listing/catalog can only surface what it is given. Memory-toolset gate
+            # mirrors inject_memory_provider_tools; registry-side copies of the same
+            # verbs win (dedupe in _merge_deferred_provider_defs, kanban t_a86c18b8).
+            filtered_tools = _merge_deferred_provider_defs(
+                filtered_tools, enabled_toolsets, disabled_toolsets)
             assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(), config=ts_cfg)
             if assembly.activated and not quiet_mode:
                 print(f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
@@ -703,6 +719,37 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+def _merge_deferred_provider_defs(
+    tool_defs: List[Dict[str, Any]],
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    """Append the deferred memory-provider defs to *tool_defs*, skipping names the list
+    already carries (kanban t_a86c18b8). A memory plugin typically registers its verbs as
+    registry plugin tools as well; without the filter the bridge universe lists every
+    provider verb twice — duplicate search hits, inflated ``total_available``, and
+    collapse-size decisions taken on a double-counted surface. The copy already in the
+    list wins: it is the schema the scope gate and ``validate_deferred_call_args`` check
+    against, so catalog output and validation stay consistent. Returns *tool_defs*
+    unchanged when there is nothing to add; never raises."""
+    try:
+        from agent.memory_manager import deferred_provider_tool_defs
+        _mem_present = any((t.get("function") or {}).get("name") == "memory"
+                           for t in tool_defs if isinstance(t, dict))
+        provider_defs = deferred_provider_tool_defs(
+            enabled_toolsets, disabled_toolsets, memory_tool_present=_mem_present)
+        if not provider_defs:
+            return tool_defs
+        have = {(t.get("function") or {}).get("name") for t in tool_defs if isinstance(t, dict)}
+        extra = [t for t in provider_defs if (t.get("function") or {}).get("name") not in have]
+        if not extra:
+            return tool_defs
+        return list(tool_defs) + extra
+    except Exception:
+        logger.debug("memory-provider deferral merge skipped", exc_info=True)
+        return tool_defs
+
+
 def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
                           enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]]):
     """Handle a Tool Search bridge call (tool_search / tool_describe / tool_call).
@@ -724,6 +771,10 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
                                             quiet_mode=True, skip_tool_search_assembly=True) or []
     except Exception:
         current_defs = []
+    # Deferred memory-provider tools are part of the bridge universe even though
+    # they never enter the registry (kanban t_eb99c448); same memory-toolset gate
+    # as the assembly merge above, same dedupe (registry copies win, kanban t_a86c18b8).
+    current_defs = _merge_deferred_provider_defs(current_defs, enabled_toolsets, disabled_toolsets)
     args = function_args or {}
     if function_name == ts.TOOL_SEARCH_NAME:
         return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None

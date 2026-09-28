@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -112,6 +113,140 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     return memory_provider_tools_enabled(enabled, disabled, memory_tool_present=present)
 
 
+# -- Provider-tool deferral behind the tool_search bridge ---------------------
+# (kanban t_eb99c448) A full memory-provider surface — Mnemosyne ships 41 tools,
+# ~13k tokens of schema — is mostly cold: recall/remember carry the memory loop
+# while persona/triple/sync/diagnostic verbs are occasional. With
+# `memory.provider_tool_deferral.enabled` the cold tail stays OUT of the eager
+# tool array and becomes discoverable/invocable through the tool_search bridge:
+#
+#   - schemas are registered here at plugin load (register_memory_provider →
+#     register_provider_tool_defs) so model_tools can merge them into the
+#     disclosure assembly and the bridge catalog/search/describe can see them;
+#   - inject_memory_provider_tools attaches ONLY the eager tools (config list,
+#     default mnemosyne_recall + mnemosyne_remember);
+#   - execution stays session-bound: direct calls hit MemoryManager.has_tool as
+#     before, and agent.tool_executor unwraps bridge tool_calls that target a
+#     provider tool back onto that same session-bound path — the global tool
+#     registry never sees these handlers (providers are per-session; a global
+#     dispatch would write into the wrong session).
+#
+# Default OFF: behavior is unchanged everywhere unless a profile opts in.
+_PROVIDER_TOOL_DEFS: Dict[str, Dict[str, Any]] = {}  # name -> bare schema
+_PROVIDER_TOOL_DEFS_LOCK = threading.Lock()
+_PROVIDER_DEFS_GENERATION = 0  # bumped only when store CONTENT changes (defs-cache key input)
+_DEFAULT_EAGER_PROVIDER_TOOLS = ("mnemosyne_recall", "mnemosyne_remember")
+_POLICY_CACHE_TTL_S = 5.0
+# Keyed by the ACTIVE profile's config path (get_config_path() follows the per-turn
+# Hermes-home override a multiplex gateway installs). One process-wide slot let any
+# staff-profile agent init — whose config.yaml has no `memory.provider_tool_deferral`
+# block — poison the policy for every other profile's injects for the whole TTL, which
+# is exactly how the Fleet api_server surface kept re-attaching all 41 provider tools
+# after the deferral shipped (kanban t_eb99c448).
+_policy_cache: Dict[str, Any] = {}     # scope key -> (ts, policy dict)
+_deferred_names_cache: Dict[str, Any] = {}  # scope key -> (ts, frozenset)
+
+
+def _policy_scope_key() -> str:
+    """Active profile's config path; '' when unresolvable (single shared entry)."""
+    try:
+        from hermes_cli.config import get_config_path
+        return str(get_config_path())
+    except Exception:
+        return ""
+
+
+def provider_defs_generation() -> int:
+    """Monotonic counter bumped when the discovery store's content changes. Part of
+    model_tools' tool-defs cache key so a resolve that ran BEFORE the provider
+    registered its schemas is not pinned for the whole registry generation."""
+    with _PROVIDER_TOOL_DEFS_LOCK:
+        return _PROVIDER_DEFS_GENERATION
+
+
+def register_provider_tool_defs(schemas: Any) -> int:
+    """Store provider tool schemas for bridge discovery (idempotent); returns total stored."""
+    global _PROVIDER_DEFS_GENERATION
+    changed = False
+    with _PROVIDER_TOOL_DEFS_LOCK:
+        for raw in schemas or []:
+            schema = normalize_tool_schema(raw)
+            if schema is None:
+                continue
+            if _PROVIDER_TOOL_DEFS.get(schema["name"]) != schema:
+                _PROVIDER_TOOL_DEFS[schema["name"]] = schema
+                changed = True
+        total = len(_PROVIDER_TOOL_DEFS)
+        if changed:
+            _PROVIDER_DEFS_GENERATION += 1
+    _deferred_names_cache.clear()  # invalidate across every scope
+    return total
+
+
+def provider_tool_deferral_policy() -> Dict[str, Any]:
+    """Resolved `memory.provider_tool_deferral` config for the ACTIVE profile scope;
+    fail-closed to OFF. Per-scope TTL cache — never shared across config paths."""
+    now = time.time()
+    key = _policy_scope_key()
+    hit = _policy_cache.get(key)
+    if hit is not None and now - hit[0] < _POLICY_CACHE_TTL_S:
+        return hit[1]
+    policy = {"enabled": False, "eager_tools": list(_DEFAULT_EAGER_PROVIDER_TOOLS)}
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        cfg = load_config_readonly()
+        policy["enabled"] = bool(cfg_get(cfg, "memory", "provider_tool_deferral", "enabled", default=False))
+        eager = cfg_get(cfg, "memory", "provider_tool_deferral", "eager_tools", default=None)
+        if isinstance(eager, (list, tuple)) and eager:
+            policy["eager_tools"] = [str(n) for n in eager if str(n).strip()]
+    except Exception:
+        logger.debug("memory.provider_tool_deferral unreadable — deferral off", exc_info=True)
+    if len(_policy_cache) > 64:  # pathological scope churn: bound the dict, entries re-read
+        _policy_cache.clear()
+    _policy_cache[key] = (now, policy)
+    return policy
+
+
+def deferred_provider_tool_names() -> frozenset:
+    """Provider tool names currently deferred behind the bridge (empty when policy off)."""
+    now = time.time()
+    key = _policy_scope_key()
+    hit = _deferred_names_cache.get(key)
+    if hit is not None and now - hit[0] < _POLICY_CACHE_TTL_S:
+        return hit[1]
+    result: frozenset = frozenset()
+    with _PROVIDER_TOOL_DEFS_LOCK:
+        if _PROVIDER_TOOL_DEFS and provider_tool_deferral_policy().get("enabled"):
+            eager = set(provider_tool_deferral_policy().get("eager_tools") or [])
+            result = frozenset(n for n in _PROVIDER_TOOL_DEFS if n not in eager)
+    if len(_deferred_names_cache) > 64:
+        _deferred_names_cache.clear()
+    _deferred_names_cache[key] = (now, result)
+    return result
+
+
+def is_deferred_provider_tool(name: str) -> bool:
+    """True when *name* is a memory-provider tool currently deferred behind the bridge.
+    Consulted by tools.tool_search.is_deferrable_tool_name so classification, the
+    bridge catalog gate and resolve_underlying_call all agree."""
+    return bool(name) and name in deferred_provider_tool_names()
+
+
+def deferred_provider_tool_defs(enabled_toolsets: Optional[List[str]] = None,
+                                disabled_toolsets: Optional[List[str]] = None,
+                                *, memory_tool_present: bool = True) -> List[Dict[str, Any]]:
+    """OpenAI-shaped defs for the deferred provider tools, honoring the same memory-toolset
+    gate as inject_memory_provider_tools; empty when the policy is off."""
+    if not deferred_provider_tool_names():
+        return []
+    if not memory_provider_tools_enabled(enabled_toolsets, disabled_toolsets,
+                                         memory_tool_present=memory_tool_present):
+        return []
+    with _PROVIDER_TOOL_DEFS_LOCK:
+        return [{"type": "function", "function": dict(_PROVIDER_TOOL_DEFS[n])}
+                for n in sorted(_PROVIDER_TOOL_DEFS) if n in deferred_provider_tool_names()]
+
+
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface; return count added."""
     memory_manager = getattr(agent, "_memory_manager", None)
@@ -139,22 +274,50 @@ def inject_memory_provider_tools(agent: Any) -> int:
     if not callable(get_schemas):
         return 0
 
+    _raw_schemas = get_schemas()
+    schemas = list(_raw_schemas) if isinstance(_raw_schemas, (list, tuple)) else []
+    # Keep the bridge-discovery store fresh (normally populated at plugin load,
+    # before the first tool-defs assembly).
+    try:
+        register_provider_tool_defs(schemas)
+    except Exception:
+        logger.debug("provider tool-def store update failed", exc_info=True)
+
     if getattr(agent, "valid_tool_names", None) is None:
         agent.valid_tool_names = set()
     existing_tool_names = {_tool_name(tool) for tool in tools if isinstance(tool, dict)}
+
+    # Deferral policy: with the bridge present on this surface, only the eager
+    # set gets attached schemas; the rest stay valid tool names (direct calls
+    # and skills gating keep working) but ride behind tool_search.
+    bridge_present = "tool_search" in existing_tool_names
+    policy = provider_tool_deferral_policy()
+    defer_on = bool(policy.get("enabled")) and bridge_present
+    eager_names = set(policy.get("eager_tools") or []) if defer_on else None
+
     added = 0
-    for raw_schema in get_schemas():
+    deferred = 0
+    for raw_schema in schemas:
         schema = normalize_tool_schema(raw_schema)
         if schema is None:
             logger.warning(
                 "Memory provider returned a tool schema with no resolvable "
                 "name; skipping to avoid poisoning the request (%r)", raw_schema,
             )
-        elif schema["name"] not in existing_tool_names:
+            continue
+        name = schema["name"]
+        if name not in existing_tool_names and agent.valid_tool_names is not None:
+            agent.valid_tool_names.add(name)
+        if eager_names is not None and name not in eager_names:
+            deferred += 1
+            continue
+        if name not in existing_tool_names:
             tools.append({"type": "function", "function": schema})
-            agent.valid_tool_names.add(schema["name"])
-            existing_tool_names.add(schema["name"])
+            existing_tool_names.add(name)
             added += 1
+    if deferred:
+        logger.info("Memory provider tools: %d attached, %d deferred behind tool_search",
+                    added, deferred)
     return added
 
 
@@ -438,7 +601,18 @@ class MemoryManager:
         """Join every provider's non-empty ``system_prompt_block()`` with blank lines."""
         blocks = self._each_provider("system_prompt_block() failed", lambda p: p.system_prompt_block(),
                                       level=logging.WARNING)
-        return "\n\n".join(b for b in blocks if b and b.strip())
+        text = "\n\n".join(b for b in blocks if b and b.strip())
+        # Deferral disclosure (kanban t_eb99c448): the block may name tools that now
+        # ride behind the bridge — tell the model how to reach them.
+        try:
+            n_deferred = len(deferred_provider_tool_names())
+        except Exception:
+            n_deferred = 0
+        if text and n_deferred:
+            text += (f"\n\n({n_deferred} additional memory tools are deferred behind tool_search: "
+                     "find them with tool_search, read their schema with tool_describe, "
+                     "invoke them with tool_call.)")
+        return text
 
     # A /skill or /bundle turn embeds the whole skill body in the model-facing message;
     # providers get just the user's instruction (None for a bare invocation).

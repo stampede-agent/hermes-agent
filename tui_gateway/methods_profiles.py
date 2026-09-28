@@ -23,6 +23,8 @@ def _profile_handler(name: str, code: int):
     def deco(fn):
         def handler(rid, params: dict) -> dict:
             try:
+                from hermes_cli import profile_access as _pa  # stampede-local: profile access
+                _pa.guard_profile_rpc(name, params, getattr(current_transport(), "auth_identity", None))
                 return fn(rid, params)
             except Exception as e:
                 return _err(rid, code, str(e))
@@ -270,8 +272,13 @@ def _(rid, params: dict) -> dict:
     from hermes_cli.profiles import list_profiles
     include_sessions = is_truthy_value(params.get("include_sessions", True))
     out = []
+    # stampede-local (hermes_cli/profile_access.py): a signed-in non-admin's roster shows
+    # only their own (+shared) agents; the launch/default profile is never listed for them.
+    from hermes_cli import profile_access as _pa
+    _ident = _pa.normalize_identity((getattr(current_transport(), "auth_identity", None) or {}).get("user_id"))
+    _rows = _pa.filter_profiles(list_profiles(lazy_skill_count=True), identity=_ident) if _pa.restricted(_ident) else list_profiles(lazy_skill_count=True)
     # Roster polls this every 5s: ``skill_count`` is the last known value, refreshed off-request.
-    for p in list_profiles(lazy_skill_count=True):
+    for p in _rows:
         row = {"name": p.name, "path": str(p.path), "is_default": bool(p.is_default), "model": p.model,
                "provider": p.provider, "description": p.description or "",
                "display_name": p.display_name or "", "skill_count": p.skill_count or 0,

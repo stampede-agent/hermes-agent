@@ -1665,6 +1665,39 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
             error_result=lambda e: json.dumps({"error": f"Memory tool '{function_name}' failed: {e}"}),
             error_log="memory_manager.handle_tool_call raised for %s: %s",
         )
+    if agent._memory_manager and function_name == "tool_call":
+        # Bridge call targeting a DEFERRED memory-provider tool (kanban t_eb99c448):
+        # unwrap here so execution stays on the session-bound MemoryManager path.
+        # handle_function_call's internal recursion can't see provider handlers
+        # (they never enter the global registry), and a process-global dispatcher
+        # would write into the wrong session (providers are per-session objects).
+        # Anything else (connector batches, registry-deferred tools) falls through
+        # to the normal bridge handling below.
+        try:
+            from tools import tool_search as ts
+            _under, _uargs, _uerr = ts.resolve_underlying_call(function_args or {})
+        except Exception:
+            _under, _uargs, _uerr = None, {}, "unresolved"
+        if not _uerr and _under and agent._memory_manager.has_tool(_under):
+            _mm = agent._memory_manager
+            _under_name = _under
+
+            def _exec_bridge_memory(next_args: dict, _mm=_mm) -> Any:
+                try:
+                    from tools import tool_search as ts2
+                    name2, args2, err2 = ts2.resolve_underlying_call(next_args or {})
+                except Exception:
+                    name2, args2, err2 = None, {}, "unresolved"
+                if err2 or not name2 or not _mm.has_tool(name2):
+                    return json.dumps({"error": f"Memory tool bridge call unresolved ({err2 or name2})"})
+                return _mm.handle_tool_call(name2, args2 or {})
+
+            return _SequentialDispatch(
+                execute=_exec_bridge_memory,
+                spinner=_start_quiet_tool_spinner(agent, _under_name, _uargs or {}),
+                error_result=lambda e: json.dumps({"error": f"Memory tool '{_under_name}' failed: {e}"}),
+                error_log="memory bridge tool_call raised for %s: %s",
+            )
 
     # Registry tools: post hook is owned by this executor (inner observer suppressed).
     def _execute(next_args: dict) -> Any:

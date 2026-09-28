@@ -309,8 +309,15 @@ def _skills_prompt(agent: Any) -> str:
         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
     except Exception:
         _compact_cats = frozenset()
+    # Operator-chosen index compaction (skills.index_style, kanban t_eb99c448):
+    # e.g. Fleet's api_server surface trims every description to its trigger line.
+    try:
+        _index_style = _pb.resolve_skills_index_style(getattr(agent, "platform", None))
+    except Exception:
+        _index_style = "full"
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
+                                         index_style=_index_style)
 
 
 def _auto_load_parts(agent: Any) -> List[str]:

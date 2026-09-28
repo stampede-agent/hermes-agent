@@ -62,7 +62,8 @@ def _drop_side_agent_tools(agent, new_defs: list, new_names: set) -> tuple:
 
 def _publish_tool_snapshot(
     agent, new_defs: list, new_names: set, *, snapshot_generation: int,
-    staged_engine_names: set, content_aware: bool, prefix_registered: Optional[set]) -> Optional[set]:
+    staged_engine_names: set, content_aware: bool, prefix_registered: Optional[set],
+    extra_valid_names: Optional[set] = None) -> Optional[set]:
     """Single atomic read-diff-publish under ``_agent_tools_lock`` so ``added`` matches what
     was published and a stale (older-generation) rebuild can't overwrite a newer one. Returns
     the added names, or None when nothing was published (unchanged, or a newer snapshot won)."""
@@ -84,7 +85,9 @@ def _publish_tool_snapshot(
         if new_names == current and not (content_aware and _tool_defs_content_changed(agent, new_defs)):
             return None
         agent.tools = new_defs
-        agent.valid_tool_names = new_names
+        # Provider verbs kept OFF the wire by the deferral policy stay valid tool
+        # names (direct calls / skills gating), mirroring inject_memory_provider_tools.
+        agent.valid_tool_names = (new_names | extra_valid_names) if extra_valid_names else new_names
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):
@@ -119,7 +122,7 @@ def refresh_agent_mcp_tools(
     new_defs = list(get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode) or [])
     new_names = {_def_name(t) for t in new_defs}
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
-    staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    staged_engine_names, deferred_provider_names = _reinject_post_build_tools(agent, new_defs, new_names)
     _reinject_authorized_dynamic_tools(agent, new_defs, new_names)
     # Registry membership is read OUTSIDE ``_agent_tools_lock``: taking ``registry._lock``
     # under the tools lock would be the first nesting of the two.
@@ -131,7 +134,8 @@ def refresh_agent_mcp_tools(
             pass  # fail open to the plain rebuild
     added = _publish_tool_snapshot(
         agent, new_defs, new_names, snapshot_generation=snapshot_generation,
-        staged_engine_names=staged_engine_names, content_aware=content_aware, prefix_registered=prefix_registered)
+        staged_engine_names=staged_engine_names, content_aware=content_aware, prefix_registered=prefix_registered,
+        extra_valid_names=deferred_provider_names)
     if added is None:
         return set()
     persist_agent_tool_names(agent)  # re-pin so a rebuild after agent-cache eviction restores this order
@@ -232,6 +236,15 @@ def restore_agent_tool_prefix(agent, saved) -> bool:
     if changed:
         with _agent_tools_lock:
             agent.tools = merged
+            # A pin restore must not strip the policy-deferred provider verbs from the
+            # valid-name set: inject_memory_provider_tools keeps EVERY provider name
+            # valid (direct calls / skills gating) while the wire carries only the
+            # eager pair (kanban t_eb99c448).
+            try:
+                from agent.memory_manager import deferred_provider_tool_names
+                merged_names = merged_names | deferred_provider_tool_names()
+            except Exception:  # noqa: BLE001
+                pass  # fail soft: the fresh build's names still stand
             agent.valid_tool_names = merged_names
     if not same_code or merged != list(pinned):
         persist_agent_tool_names(agent)
@@ -277,11 +290,14 @@ def _reinject_authorized_dynamic_tools(agent, tools_list: list, name_set: set) -
         name_set.add(MESSAGE_AGENT_TOOL_NAME)
 
 
-def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
+def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> tuple:
     """Append memory-provider and context-engine tools onto the caller's staged ``tools_list``
     / ``name_set`` (never the live agent attributes), mirroring ``agent_init``'s post-build
-    injection. Idempotent and fail-soft. Returns the context-engine routing names THIS rebuild
-    appended: a name already owned by a registry/plugin tool is not claimed, matching agent_init."""
+    injection. Idempotent and fail-soft. Returns ``(staged_engine_names, deferred_provider_names)``:
+    the context-engine routing names THIS rebuild appended (a name already owned by a
+    registry/plugin tool is not claimed, matching agent_init), and the provider verbs the
+    deferral policy keeps OFF the wire — callers keep those as valid tool names, mirroring
+    ``inject_memory_provider_tools`` (kanban t_eb99c448)."""
     def _add(schema) -> bool:
         name = schema.get("name", "") if isinstance(schema, dict) else ""
         if not name or name in name_set:
@@ -295,13 +311,27 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         return getter if callable(getter) else None
 
     enabled = getattr(agent, "enabled_toolsets", None)
+    deferred_provider_names: set = set()
     try:
         get_mem_schemas = _schema_getter("_memory_manager", "get_all_tool_schemas")
         if get_mem_schemas is not None:
             from agent.memory_manager import memory_provider_tools_enabled  # same gate inject_memory_provider_tools uses
             if memory_provider_tools_enabled(
                     enabled, getattr(agent, "disabled_toolsets", None), memory_tool_present="memory" in name_set):
+                # Mirror inject_memory_provider_tools' deferral (kanban t_eb99c448): with a
+                # scoped policy on and the bridge staged, only the eager pair re-attaches.
+                # The unconditional re-append silently re-fattened the slim wire on EVERY
+                # between-turns refresh (live Fleet turns: n_tools 91, first call 41,633
+                # tokens — the deferral savings never reached the request).
+                from agent.memory_manager import provider_tool_deferral_policy
+                policy = provider_tool_deferral_policy()
+                defer_on = bool(policy.get("enabled")) and "tool_search" in name_set
+                eager_names = set(policy.get("eager_tools") or []) if defer_on else None
                 for schema in get_mem_schemas():
+                    name = schema.get("name", "") if isinstance(schema, dict) else ""
+                    if eager_names is not None and name and name not in eager_names:
+                        deferred_provider_names.add(name)
+                        continue
                     _add(schema)
     except Exception:
         logger.debug("Memory-provider tool re-injection skipped", exc_info=True)
@@ -318,4 +348,4 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
             staged_engine_names.update(s["name"] for s in get_schemas() if _add(s))
     except Exception:
         logger.debug("Context-engine tool re-injection skipped", exc_info=True)
-    return staged_engine_names
+    return staged_engine_names, deferred_provider_names

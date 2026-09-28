@@ -224,6 +224,15 @@ def _profile_targets(log_label: str) -> List[Tuple[str, Path]]:
         targets = []
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
+    # stampede-local (hermes_cli/profile_access.py): a signed-in non-admin only fans out
+    # across homes they may see; none visible → their own home alone, never the launch home.
+    from hermes_cli import profile_access as _pa
+    ident = _pa.current_request_identity()
+    if _pa.restricted(ident):
+        targets = [t for t in targets if _pa.profile_visible_to(t[1], identity=ident, name=t[0])]
+        if not targets:
+            own = _pa.own_profile_home(ident)
+            targets = [(own.name, own)] if own else []
     return targets
 
 
@@ -789,6 +798,12 @@ def _read_profiles():
     try:
         # Polled by the Desktop on every focus/roster tick: never walk skill trees in-request.
         profiles = profiles_mod.list_profiles(lazy_skill_count=True)
+        # stampede-local: a signed-in non-admin sees only their own (+shared) agents.
+        from hermes_cli import profile_access as _pa
+        ident = _pa.current_request_identity()
+        if _pa.restricted(ident):
+            profiles = _pa.filter_profiles(profiles, identity=ident) or _pa.filter_profiles(
+                profiles_mod.list_profiles(lazy_skill_count=True), identity=ident)
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")

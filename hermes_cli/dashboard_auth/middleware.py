@@ -130,7 +130,8 @@ async def _serve_refreshed(request: Request, call_next, new_session, provider: s
     the ROTATED RT is mandatory: Portal runs reuse detection, so replaying the stale RT would
     revoke the session."""
     request.state.session = new_session
-    response = await call_next(request)
+    from hermes_cli.profile_access import call_as  # stampede-local: profile access
+    response = await call_as(request, new_session, call_next)
     set_session_cookies(
         response, access_token=new_session.access_token, refresh_token=new_session.refresh_token,
         access_token_expires_in=_expires_in_seconds(new_session), use_https=detect_https(request),
@@ -171,7 +172,8 @@ async def gated_auth_middleware(
             return unreachable_response(str(e))
         if bearer_session is not None:
             request.state.session = bearer_session
-            return await call_next(request)
+            from hermes_cli.profile_access import call_as  # stampede-local: profile access
+            return await call_as(request, bearer_session, call_next)
         return _unauth_response(request, reason="invalid_or_expired_session")
 
     at, _rt = read_session_cookies(request)
@@ -202,7 +204,8 @@ async def gated_auth_middleware(
         return await _serve_refreshed(request, call_next, *refreshed)
 
     request.state.session = session
-    response = await call_next(request)
+    from hermes_cli.profile_access import call_as  # stampede-local: profile access
+    response = await call_as(request, session, call_next)
     if not provider_hint and session.provider:
         set_session_provider_cookie(
             response, provider=session.provider, use_https=detect_https(request),

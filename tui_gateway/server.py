@@ -537,8 +537,20 @@ class ProfileUnavailableError(FileNotFoundError):
 
 
 def _profile_home(profile: str | None) -> Path | None:
-    """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    if not (name := _canonical_profile_request((profile or "").strip())):
+    """Resolve a named profile's home on THIS host, or None for the launch profile.
+
+    stampede-local (hermes_cli/profile_access.py): a signed-in non-admin resolves an omitted
+    profile to THEIR OWN owner-bound home and can never resolve the launch profile or another
+    person's; a foreign name is reported as non-existent."""
+    name = _canonical_profile_request((profile or "").strip())
+    from hermes_cli import profile_access as _pa
+    _ident = _pa.normalize_identity((getattr(current_transport(), "auth_identity", None) or {}).get("user_id"))
+    _restricted = _pa.restricted(_ident)
+    if _restricted and not name:
+        if (own := _pa.own_profile_home(_ident)) is None:
+            raise ProfileUnavailableError("Your workspace is being set up. Sign out and back in to finish.")
+        name = own.name
+    if not name:
         return None
     from hermes_cli import profiles as profiles_mod
     try:
@@ -546,6 +558,8 @@ def _profile_home(profile: str | None) -> Path | None:
     except ValueError:
         home = None
     if home is None or not home.is_dir():
+        raise ProfileUnavailableError(f"Profile '{name}' does not exist.")
+    if _restricted and not _pa.profile_visible_to(home, identity=_ident, name=name):
         raise ProfileUnavailableError(f"Profile '{name}' does not exist.")
     if home.resolve() == Path(_hermes_home).resolve():
         return None  # already the launch profile (no override needed)
@@ -590,6 +604,9 @@ def _profile_scoped(handler):
         else:
             session = _sessions.get(str(p.get("session_id") or ""))
             profile_home = session.get("profile_home") if isinstance(session, dict) else None
+            if profile_home is None:  # stampede-local: non-admins never get the launch scope
+                home = _profile_home(None)
+                profile_home = str(home) if home else None
         with _session_profile_runtime_scope({"profile_home": profile_home or None}):
             return handler(rid, params)
     return wrapper

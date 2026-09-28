@@ -120,6 +120,19 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
         raise HTTPException(status_code=400, detail=str(e))
     if not profiles_mod.profile_exists(canon):
         raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
+    # stampede-local (hermes_cli/profile_access.py): a signed-in non-admin resolves an
+    # omitted profile to their own home and cannot name the launch profile or a peer's.
+    from hermes_cli import profile_access as _pa
+    ident = _pa.current_request_identity()
+    if _pa.restricted(ident):
+        if (profile or "").strip():
+            if not _pa.profile_visible_to(profiles_mod.get_profile_dir(canon), identity=ident, name=canon):
+                raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
+        else:
+            own = _pa.own_profile_home(ident)
+            if own is None:
+                raise HTTPException(status_code=409, detail="Your workspace is being set up.")
+            return own.name, own
     return canon, profiles_mod.get_profile_dir(canon)
 
 

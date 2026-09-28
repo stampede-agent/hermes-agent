@@ -150,13 +150,21 @@ _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defe
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
-    plugin tool). Bridge names never defer."""
+    plugin tool), OR a memory-provider tool held behind the bridge by
+    ``memory.provider_tool_deferral`` (kanban t_eb99c448 — provider tools never enter the
+    registry, so classification asks the memory manager). Bridge names never defer."""
     if name in BRIDGE_TOOL_NAMES:
         return False
     if defer_tools is not None and name in defer_tools:
         return True
     if name in _core_tool_names():
         return False
+    try:
+        from agent.memory_manager import is_deferred_provider_tool
+        if is_deferred_provider_tool(name):
+            return True
+    except Exception:
+        pass  # classification must never fail on the memory-side lookup
     toolset = _registry_toolset(name)  # None (unregistered/malformed) never defers
     return toolset is not None and (
         toolset.startswith("mcp-") or toolset not in _DIRECT_SURFACE_TOOLSETS)

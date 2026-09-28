@@ -760,6 +760,17 @@ class PluginContext:
         self._memory_provider = provider
         logger.debug("Plugin '%s' registered memory provider: %s", self.manifest.name,
                      getattr(provider, "name", "?"))
+        # Publish the provider's tool schemas to the tool_search disclosure store
+        # (kanban t_eb99c448) BEFORE the first tool-defs assembly of the process, so
+        # `memory.provider_tool_deferral` can keep the cold tail out of the eager tool
+        # array while the bridge catalog still lists/searches/describes it. Storing is
+        # inert unless a profile enables the deferral policy. Never fatal.
+        try:
+            from agent.memory_manager import register_provider_tool_defs
+            register_provider_tool_defs(provider.get_tool_schemas())
+        except Exception:
+            logger.debug("Plugin '%s': memory provider tool-def publication skipped",
+                         self.manifest.name, exc_info=True)
 
     @_serialized_replacement
     def register_dashboard_auth_provider(self, provider) -> Optional[PluginRegistration]:

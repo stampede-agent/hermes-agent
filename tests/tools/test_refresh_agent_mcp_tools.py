@@ -542,3 +542,42 @@ def test_snapshot_rebuild_never_grants_message_agent_to_unauthorized_sessions(
         assert _message_agent_schema_count(agent) == 0
         assert "message_agent" not in agent.valid_tool_names
         _assert_tool_snapshot_coherent(agent)
+
+
+def test_refresh_rebuild_slims_refattened_provider_wire(monkeypatch):
+    """t_eb99c448 second fault: the between-turns rebuild used to re-append EVERY
+    memory-provider verb, so each live Fleet turn shipped 91 tools / 41,633
+    first-call tokens even though init-time injection deferred correctly. With the
+    deferral policy on and the bridge staged, a rebuild of a fat snapshot must
+    publish the slim wire again (eager pair only) while every provider name stays
+    valid for direct calls and skills gating."""
+    import time as _time
+
+    from agent import memory_manager as mm
+
+    monkeypatch.setattr(mm, "_policy_scope_key", lambda: "refresh-scope")
+    monkeypatch.setattr(mm, "_policy_cache", {
+        "refresh-scope": (_time.time() + 3600,
+                          {"enabled": True, "eager_tools": ["mem_recall", "mem_remember"]})})
+    monkeypatch.setattr(mm, "_deferred_names_cache", {})
+
+    # Live snapshot as the buggy rebuild left it: every provider verb on the wire.
+    agent = _agent(["read_file", "memory", "tool_search",
+                    "mem_recall", "mem_remember", "mem_sleep", "mem_export"])
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: [
+            {"name": n, "description": "", "parameters": {}}
+            for n in ("mem_recall", "mem_remember", "mem_sleep", "mem_export")])
+
+    import model_tools
+    # Registry-derived defs: slim surface + bridge, no provider verbs (assembly
+    # defers them all; the eager pair re-attaches via the rebuild mirror).
+    monkeypatch.setattr(model_tools, "get_tool_definitions",
+                        lambda **kw: [_tool("read_file"), _tool("memory"), _tool("tool_search")])
+
+    added = _mcp_agent.refresh_agent_mcp_tools(agent)
+
+    wire = [t["function"]["name"] for t in agent.tools]
+    assert wire == ["read_file", "memory", "tool_search", "mem_recall", "mem_remember"]
+    assert {"mem_sleep", "mem_export"} <= agent.valid_tool_names
+    assert added == set()  # nothing new on the wire — the snapshot only slimmed
