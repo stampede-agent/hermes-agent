@@ -21,9 +21,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_TURN_LIVENESS_TIMEOUT_S = 600.0
 DEFAULT_TURN_LIVENESS_POLL_S = 15.0
 MIN_TURN_LIVENESS_POLL_S = 0.01
+# Bound (seconds) on how long the abort's hard interrupt waits for an in-flight
+# compression commit fence before publishing anyway (#t_3d185287). The 02:38→03:13
+# recovery gap was a single interrupt() call parked in cancel_before_commit() behind a
+# SessionDB-lock-wedged commit; the wait is what the bound caps — the commit itself is
+# never cancelled, so transcript safety is unchanged.
+DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S = 60.0
 
 _CONFIG_TIMEOUT_KEY = "agent.turn_liveness.timeout_s"
 _CONFIG_POLL_KEY = "agent.turn_liveness.poll_s"
+_CONFIG_ABORT_COMMIT_WAIT_KEY = "agent.turn_liveness.abort_commit_wait_s"
 
 
 class ActivitySnapshot(NamedTuple):
@@ -83,6 +90,31 @@ def resolve_turn_liveness_settings(
     if timeout_s <= 0:
         timeout_s = None
     return timeout_s, poll_s
+
+
+def resolve_liveness_abort_commit_wait_s(
+    config: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Resolve ``agent.turn_liveness.abort_commit_wait_s`` (#t_3d185287).
+
+    Bounds how long the watchdog abort's hard interrupt waits for an in-flight
+    compression commit fence before publishing anyway. ``0`` is legal (single
+    non-blocking fence attempt); negative values are invalid — they would raise
+    inside ``Lock.acquire`` — and warn + fall back to the default, as do typos,
+    NaN and Inf. Never raises.
+    """
+    agent_cfg = config.get("agent") if isinstance(config, dict) else None
+    raw_section = agent_cfg.get("turn_liveness") if isinstance(agent_cfg, dict) else None
+    section: Dict[str, Any] = raw_section if isinstance(raw_section, dict) else {}
+    wait_s = _resolve_finite_seconds(
+        section.get("abort_commit_wait_s", DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S),
+        default=DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S, key=_CONFIG_ABORT_COMMIT_WAIT_KEY,
+    )
+    if wait_s < 0:
+        _warn_invalid_value(_CONFIG_ABORT_COMMIT_WAIT_KEY, wait_s,
+                            DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S)
+        wait_s = DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S
+    return wait_s
 
 
 class TurnLivenessWatchdog:

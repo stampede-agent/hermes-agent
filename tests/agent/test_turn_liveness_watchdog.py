@@ -82,6 +82,7 @@ class _BlockingCommitFence:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.calls = 0
+        self.timeouts = []
 
     @property
     def commit_in_flight(self) -> bool:
@@ -92,11 +93,14 @@ class _BlockingCommitFence:
         # finish_commit WITHOUT cancelling).
         return True
 
-    def cancel_before_commit(self, cancel_event=None):
-        # `cancel_event` is accepted (and ignored) to mirror the production
-        # fence signature; publication happens at the final claim edge, so
-        # nothing observable is set here.
+    def cancel_before_commit(self, cancel_event=None, *, timeout=None):
+        # `cancel_event` and `timeout` are accepted to mirror the production
+        # fence signature (the bounded wait from #t_3d185287 arrives as
+        # `timeout`; a double that rejects it would TypeError and silently
+        # break the abort path). Publication happens at the final claim edge,
+        # so nothing observable is set here beyond the recorded call.
         self.calls += 1
+        self.timeouts.append(timeout)
         self.entered.set()
         assert self.release.wait(10.0), "fence was never released"
         return True
@@ -576,6 +580,15 @@ def test_watchdog_declines_abort_when_activity_resumes_inside_interrupt_publicat
     # The window was really hit: the interrupt entered the fence exactly
     # once — the stale attempt declined and no retry ever fired.
     assert fence.calls == 1, f"unexpected fence admissions: {fence.calls}"
+    # #t_3d185287: the lease rides its resolved abort_commit_wait_s bound into
+    # the fence wait — the watchdog_config fixture sets no abort_commit_wait_s,
+    # so the documented default must arrive (an unbounded None would re-open
+    # the 02:38→03:13 wedged-commit recovery gap).
+    from agent.turn_liveness import DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S
+
+    assert fence.timeouts == [DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S], (
+        f"fence wait bound not forwarded by the lease: {fence.timeouts!r}"
+    )
     # The resumed turn completed normally — the stale claim was abandoned
     # at the final mutation edge without publishing any interrupt state.
     assert result["completed"] is True
@@ -753,3 +766,220 @@ def test_declined_abort_does_not_cancel_pending_compression_commit():
         "cancelled: begin_commit() refused"
     )
     fence.finish_commit()
+
+
+# ---------------------------------------------------------------------------
+# abort_commit_wait_s end-to-end (#t_3d185287): the 2026-09-28 recovery gap.
+# The watchdog fired at 02:38 but the abort's hard interrupt parked inside
+# CompressionCommitFence.cancel_before_commit() behind a wedged SessionDB
+# commit; the turn only recovered at 03:13 when the commit finished. The
+# lease now resolves agent.turn_liveness.abort_commit_wait_s and rides it as
+# commit_fence_wait_s, so the interrupt publishes within the bound — while the
+# in-flight commit is still never cancelled.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bounded_abort_config(monkeypatch):
+    """Fast watchdog plus a tight abort fence bound (the #t_3d185287 knob)."""
+    import hermes_cli.config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config_readonly",
+        lambda: {
+            "agent": {
+                "turn_liveness": {
+                    "timeout_s": 0.3,
+                    "poll_s": 0.05,
+                    "abort_commit_wait_s": 0.25,
+                },
+            }
+        },
+    )
+    return monkeypatch
+
+
+def test_watchdog_abort_publishes_past_wedged_compression_commit(
+    bounded_abort_config, monkeypatch, caplog
+):
+    """A genuinely wedged compression commit bounds — never blocks — the abort.
+
+    Reproduces the incident shape: the turn stalls while a REAL
+    ``CompressionCommitFence`` commit is in flight (its lock held from
+    ``begin_commit`` to ``finish_commit``, as during a wedged SessionDB
+    write). Pre-fix, ``interrupt()``'s fence wait was unbounded and the
+    abort published only when the commit finished (~35 min in the incident);
+    with the lease's ``commit_fence_wait_s`` bound the abort must publish
+    within it, the turn must end ``interrupted``, and the commit must NOT be
+    cancelled (transcript safety unchanged).
+    """
+    from agent.conversation_compression import CompressionCommitFence
+
+    db = _DB()
+    agent = _agent_with_db(db)
+    fence = CompressionCommitFence()
+    agent._active_compression_commit_fence = fence
+
+    commit_started = threading.Event()
+    release_commit = threading.Event()
+
+    def wedged_commit():
+        # A real production commit: holds the fence lock begin→finish.
+        assert fence.begin_commit() is True
+        commit_started.set()
+        assert release_commit.wait(30.0), "wedged commit was never released"
+        fence.finish_commit()
+
+    commit_thread = threading.Thread(target=wedged_commit, daemon=True)
+    commit_thread.start()
+    assert commit_started.wait(10.0), "commit never started"
+    assert fence.commit_in_flight
+
+    t_start = time.time()
+    observed = {}
+
+    def wedged_loop(_agent, _message, _system, history, *_a, **_k):
+        assert _agent._hard_interrupt_requested.wait(30.0), (
+            "watchdog abort never published past the wedged commit fence"
+        )
+        observed["in_flight"] = fence.commit_in_flight
+        observed["message"] = _agent._interrupt_message
+        return {
+            "final_response": "aborted",
+            "messages": history,
+            "api_calls": 0,
+            "completed": False,
+            "interrupted": True,
+        }
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="agent.turn_liveness"):
+            result = _run_turn(agent, wedged_loop, monkeypatch)
+        elapsed = time.time() - t_start
+    finally:
+        release_commit.set()
+        commit_thread.join(10.0)
+
+    # The abort published WHILE the commit was still in flight, in bounded
+    # time (watchdog 0.3s + fence bound 0.25s): pre-fix this test parked for
+    # the whole commit — the incident parked ~35 minutes.
+    assert result["interrupted"] is True
+    assert observed["in_flight"] is True
+    assert "no progress" in (observed.get("message") or "")
+    assert elapsed < 5.0, f"abort was pinned by the wedged commit: {elapsed:.1f}s"
+    # The committed-abort settlement was published (not the observational
+    # half): the watchdog only logs this once commit_liveness_abort is True.
+    assert any(
+        "watchdog aborted turn" in record.getMessage()
+        for record in caplog.records
+    )
+    # An expired fence wait cancels NOTHING: the in-flight commit was never
+    # aborted and the lease released through the interrupted-exit path.
+    assert fence.is_cancelled is False
+    assert db.events[-1][0] == "release"
+
+
+class TestCompressionFenceBoundedCancel:
+    """``cancel_before_commit(timeout=...)`` units (#t_3d185287)."""
+
+    @staticmethod
+    def _wedged_commit(fence):
+        """Start a real commit that holds the fence lock until released."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def worker():
+            assert fence.begin_commit() is True
+            started.set()
+            assert release.wait(30.0), "wedged commit was never released"
+            fence.finish_commit()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        assert started.wait(10.0), "commit never started"
+        return thread, release
+
+    def test_bounded_wait_expires_without_cancelling(self):
+        from agent.conversation_compression import CompressionCommitFence
+
+        fence = CompressionCommitFence()
+        thread, release = self._wedged_commit(fence)
+        try:
+            t0 = time.monotonic()
+            assert fence.cancel_before_commit(timeout=0.05) is False
+            elapsed = time.monotonic() - t0
+            assert 0.04 <= elapsed < 2.0, f"wait was not bounded: {elapsed:.3f}s"
+            # Expiry mirrors the waited-out-commit outcome: nothing cancelled.
+            assert fence.is_cancelled is False
+        finally:
+            release.set()
+            thread.join(10.0)
+
+    def test_zero_timeout_is_single_nonblocking_attempt(self):
+        from agent.conversation_compression import CompressionCommitFence
+
+        fence = CompressionCommitFence()
+        thread, release = self._wedged_commit(fence)
+        try:
+            t0 = time.monotonic()
+            assert fence.cancel_before_commit(timeout=0) is False
+            assert time.monotonic() - t0 < 1.0
+            assert fence.is_cancelled is False
+        finally:
+            release.set()
+            thread.join(10.0)
+
+    def test_negative_timeout_is_clamped_not_raised(self):
+        # ``threading.Lock.acquire`` REJECTS negative timeouts with
+        # ValueError — the fence must clamp instead of surfacing it into
+        # interrupt()'s abort path.
+        from agent.conversation_compression import CompressionCommitFence
+
+        fence = CompressionCommitFence()
+        thread, release = self._wedged_commit(fence)
+        try:
+            assert fence.cancel_before_commit(timeout=-5) is False
+            assert fence.is_cancelled is False
+        finally:
+            release.set()
+            thread.join(10.0)
+
+    def test_unbounded_wait_still_waits_out_the_commit(self):
+        # timeout=None (default) preserves the historical semantics exactly:
+        # wait the whole commit through, then report False.
+        from agent.conversation_compression import CompressionCommitFence
+
+        fence = CompressionCommitFence()
+        finished = threading.Event()
+
+        def worker():
+            assert fence.begin_commit() is True
+            time.sleep(0.2)
+            fence.finish_commit()
+            finished.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        deadline = time.time() + 5.0
+        while not fence.commit_in_flight and time.time() < deadline:
+            time.sleep(0.005)
+        assert fence.commit_in_flight, "commit never started"
+
+        t0 = time.monotonic()
+        assert fence.cancel_before_commit() is False
+        elapsed = time.monotonic() - t0
+        assert finished.wait(10.0)
+        thread.join(10.0)
+        assert elapsed >= 0.1, f"unbounded wait returned early: {elapsed:.3f}s"
+        assert fence.is_cancelled is False
+
+    def test_pending_commit_is_still_cancelled_with_timeout(self):
+        # The bound must not change pending-commit semantics: a commit that
+        # has NOT started is still cancelled (and cancellation wins admission).
+        from agent.conversation_compression import CompressionCommitFence
+
+        fence = CompressionCommitFence()
+        assert fence.cancel_before_commit(timeout=1.0) is True
+        assert fence.is_cancelled is True
+        assert fence.begin_commit() is False

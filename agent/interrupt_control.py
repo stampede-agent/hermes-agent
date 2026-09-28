@@ -38,7 +38,8 @@ def interrupted_during_api_call_reason(agent) -> str:
     return f"interrupted_during_api_call({issuer})" if issuer else "interrupted_during_api_call"
 
 
-def _fence_cancel_before_commit(fence, *, when_in_flight: bool, failure_log: str) -> None:
+def _fence_cancel_before_commit(fence, *, when_in_flight: bool, failure_log: str,
+                                timeout: Optional[float] = None) -> None:
     """Call ``type(fence).cancel_before_commit(fence)`` when ``commit_in_flight`` matches.
 
     Hard-cancel admission has two halves (#99758 P1). BEFORE the generation claim is
@@ -46,13 +47,21 @@ def _fence_cancel_before_commit(fence, *, when_in_flight: bool, failure_log: str
     lock and returns False WITHOUT setting ``_cancelled``) — cancelling a still-pending
     fence there would be irreversible for an abort that may yet be declined. AFTER the
     claim survived, only a still-pending commit is cancelled; one that started meanwhile
-    owns the fence and completes on its own."""
+    owns the fence and completes on its own.
+
+    ``timeout`` (seconds, #t_3d185287) bounds the in-flight wait for callers that must
+    stay responsive (the turn-liveness abort): on expiry — or when the fence predates
+    the kwarg (TypeError) — the caller proceeds having cancelled nothing, exactly like
+    the historical wait-out path, but without the unbounded block."""
     if fence is None or bool(getattr(fence, "commit_in_flight", False)) is not when_in_flight:
         return
     cancel_before_commit = getattr(type(fence), "cancel_before_commit", None)
     if callable(cancel_before_commit):
         try:
-            cancel_before_commit(fence)
+            if timeout is None:
+                cancel_before_commit(fence)
+            else:
+                cancel_before_commit(fence, timeout=timeout)
         except Exception:
             logger.debug(failure_log, exc_info=True)
 
@@ -115,13 +124,18 @@ class InterruptControlMixin:
     def interrupt(
         self, message: Optional[str] = None, *, hard_cancel: bool = False,
         tool_reason: Optional[str] = None, require_generation: Optional[int] = None,
+        commit_fence_wait_s: Optional[float] = None,
     ) -> bool:
         """Request the agent to interrupt its current tool-calling loop (call from another thread).
 
         ``hard_cancel``: explicit stop; compression may honor it even while ordinary interrupts are masked.
         ``tool_reason``: trusted fixed category safe for tool output. ``require_generation``: activity-
         generation claim — published only if the turn's generation still matches at the final mutation edge;
-        returns False if the turn resumed meanwhile.
+        returns False if the turn resumed meanwhile. ``commit_fence_wait_s`` (#t_3d185287): bounds the wait
+        for an in-flight compression commit before the interrupt publishes anyway (None = historical
+        unbounded wait). An expired wait cancels nothing — the commit still completes on its own, so
+        transcript safety is unchanged — it only keeps watchdog-driven aborts from being held hostage by a
+        wedged SessionDB commit (#95548 recovery gap).
         """
         if require_generation is not None:
             # RESERVE the claim under the SAME lock `_touch_activity` stamps with; real progress invalidates
@@ -157,7 +171,8 @@ class InterruptControlMixin:
         # survives (#99758 P1).
         with _ic_lock(self, "_pending_redirect_lock"):
             _fence_cancel_before_commit(
-                _fence(), when_in_flight=True, failure_log="Compression hard-cancel fence wait failed"
+                _fence(), when_in_flight=True, failure_log="Compression hard-cancel fence wait failed",
+                timeout=commit_fence_wait_s,
             )
             if require_generation is None:
                 # No claim to race: publish WITHOUT the liveness lock (bare AIAgent stand-ins in other
@@ -212,11 +227,15 @@ class InterruptControlMixin:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
         return True
 
-    def hard_interrupt(self, message: Optional[str] = None, *, tool_reason: Optional[str] = None) -> None:
+    def hard_interrupt(self, message: Optional[str] = None, *, tool_reason: Optional[str] = None,
+                       commit_fence_wait_s: Optional[float] = None) -> None:
         """Explicit stop preserving the ``interrupt()`` ABI (frontends feature-detect this and fall back to
         legacy ``interrupt()`` for third-party agents). Bypasses dynamic dispatch: legacy subclasses may
-        override interrupt(message=None) without hard_cancel."""
-        InterruptControlMixin.interrupt(self, message, hard_cancel=True, tool_reason=tool_reason)
+        override interrupt(message=None) without hard_cancel. ``commit_fence_wait_s`` (#t_3d185287) bounds
+        the in-flight compression-commit wait — see ``interrupt()``; producers that run on a shared
+        thread (the runs orphan-TTL sweep) pass it so a wedged commit cannot pin them."""
+        InterruptControlMixin.interrupt(self, message, hard_cancel=True, tool_reason=tool_reason,
+                                        commit_fence_wait_s=commit_fence_wait_s)
 
     def clear_interrupt(self, *, preserve_redirect: bool = False, hard_cancel: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal. ``preserve_redirect`` is only for the

@@ -125,3 +125,92 @@ def test_interrupt_turn_only_while_active():
     assert calls == ["lost"] and lease.interrupt_message == "lost"
     lease.deactivate_after_liveness_abort()
     assert lease.stop.is_set() and lease.is_turn_active() is False
+
+
+# ---------------------------------------------------------------------------
+# abort_commit_wait_s wiring (#t_3d185287): the lease resolves the fence-wait
+# bound at build time and rides it into the watchdog abort's interrupt(). The
+# 2026-09-28 incident parked the abort ~35 minutes inside
+# CompressionCommitFence.cancel_before_commit() behind a wedged SessionDB
+# commit; the bound makes that wait finite without cancelling the commit.
+# ---------------------------------------------------------------------------
+
+
+def test_commit_liveness_abort_passes_fence_bound_to_modern_agents():
+    """The committed abort forwards ``commit_fence_wait_s`` to interrupt()."""
+    from agent.turn_liveness import ActivitySnapshot
+
+    agent = _agent(_Db())
+    seen = {}
+
+    def modern_interrupt(message=None, *, hard_cancel=False, tool_reason=None,
+                         require_generation=None, commit_fence_wait_s=None):
+        seen.update(
+            message=message, hard_cancel=hard_cancel, tool_reason=tool_reason,
+            require_generation=require_generation,
+            commit_fence_wait_s=commit_fence_wait_s,
+        )
+        return True
+
+    agent.interrupt = modern_interrupt
+    lease = DurableTurnLease(agent, agent._session_db, "s1", "h")
+    lease.turn_active = True
+    lease.abort_commit_wait_s = 7.5
+    snapshot = ActivitySnapshot(generation=0, activity_ts=None, idle_seconds=999.0)
+
+    assert lease.commit_liveness_abort(snapshot, "stalled") is True
+    assert seen == {
+        "message": "stalled",
+        "hard_cancel": True,
+        "tool_reason": "turn liveness watchdog",
+        "require_generation": 0,
+        "commit_fence_wait_s": 7.5,
+    }
+    assert lease.interrupt_message == "stalled"
+
+
+def test_commit_liveness_abort_omits_fence_bound_for_legacy_agents():
+    """Legacy interrupt doubles do not know ``commit_fence_wait_s``; passing it
+    anyway would TypeError and fail the abort closed — re-opening the incident
+    where a wedged turn produced only observational logging."""
+    from agent.turn_liveness import ActivitySnapshot
+
+    agent = _agent(_Db())
+    calls = []
+
+    def legacy_interrupt(message=None, *, hard_cancel=False, tool_reason=None,
+                         require_generation=None):
+        calls.append((message, hard_cancel, tool_reason, require_generation))
+        return True
+
+    agent.interrupt = legacy_interrupt
+    lease = DurableTurnLease(agent, agent._session_db, "s1", "h")
+    lease.turn_active = True
+    snapshot = ActivitySnapshot(generation=0, activity_ts=None, idle_seconds=999.0)
+
+    assert lease.commit_liveness_abort(snapshot, "stalled") is True
+    assert calls == [("stalled", True, "turn liveness watchdog", 0)]
+
+
+def test_build_threads_resolves_abort_commit_wait_from_config(monkeypatch):
+    """``build_threads`` resolves ``agent.turn_liveness.abort_commit_wait_s``
+    onto the lease — default before resolution, configured value after — even
+    when the watchdog itself is disabled."""
+    import hermes_cli.config as config_module
+    from agent.turn_liveness import DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S
+
+    agent = _agent(_Db())
+    lease = DurableTurnLease(agent, agent._session_db, "s1", "h")
+    assert lease.abort_commit_wait_s == DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S
+
+    monkeypatch.setattr(
+        "agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0)
+    )
+    monkeypatch.setattr(
+        config_module, "load_config_readonly",
+        lambda: {"agent": {"turn_liveness": {"abort_commit_wait_s": 5}}},
+    )
+    lease.build_threads()
+    assert lease.abort_commit_wait_s == 5.0
+    # timeout_s None → no watchdog is constructed, but the bound still resolved.
+    assert lease.watchdog is None

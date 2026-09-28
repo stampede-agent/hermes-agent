@@ -525,14 +525,31 @@ class CompressionCommitFence:
         """Seconds since the worker last reported forward progress."""
         return max(0.0, time.monotonic() - self._last_progress)
 
-    def cancel_before_commit(self, cancel_event: Any = None) -> bool:
-        """Cancel a pending commit (``True``), or block until an active commit finishes (``False``)."""
-        with self._lock:
+    def cancel_before_commit(self, cancel_event: Any = None, *, timeout: Optional[float] = None) -> bool:
+        """Cancel a pending commit (``True``), or block until an active commit finishes (``False``).
+
+        ``timeout`` (seconds, #t_3d185287) bounds the in-flight wait for callers that must not be
+        held hostage by a wedged SessionDB commit (the turn-liveness abort): when the fence lock is
+        not acquired in time, return ``False`` WITHOUT setting ``_cancelled`` — the same observable
+        outcome as waiting the commit out, minus the unbounded block. The in-flight commit is never
+        abandoned either way; ``timeout=0`` is a single non-blocking attempt (mirrors
+        :meth:`try_cancel_before_commit`), and a negative value is clamped to 0 (``Lock.acquire``
+        rejects negatives). ``None`` keeps the historical unbounded wait.
+        """
+        if timeout is None:
+            acquired = self._lock.acquire()
+        else:
+            acquired = self._lock.acquire(blocking=True, timeout=max(0.0, float(timeout)))
+        if not acquired:
+            return False
+        try:
             if not self._commit_started:
                 self._cancelled = True
             if cancel_event is not None:
                 cancel_event.set()
             return not self._commit_started
+        finally:
+            self._lock.release()
 
     def try_cancel_before_commit(self) -> Optional[bool]:
         """Non-blocking :meth:`cancel_before_commit`; ``None`` while an active commit owns the fence."""

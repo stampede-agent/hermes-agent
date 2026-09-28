@@ -28,7 +28,11 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
-from gateway.platforms.api_server_runs import _RunStream
+from gateway.platforms.api_server_runs import (
+    _ORPHAN_CANCEL_COMMIT_FENCE_WAIT_S,
+    _RunStream,
+    _sweep_orphaned_live_runs,
+)
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
 
@@ -121,7 +125,10 @@ def _make_slow_agent(**kwargs):
 
     mock_agent = MagicMock()
 
-    def _do_interrupt(message=None):
+    def _do_interrupt(message=None, **kwargs):
+        # **kwargs: stop producers now forward tool_reason / commit_fence_wait_s
+        # (#t_3d185287); an unknown kwarg would TypeError inside the daemon
+        # cancel thread and the interrupt would never land.
         interrupted.set()
 
     mock_agent.interrupt = MagicMock(side_effect=_do_interrupt)
@@ -136,6 +143,10 @@ def _make_slow_agent(**kwargs):
     mock_agent.session_prompt_tokens = 0
     mock_agent.session_completion_tokens = 0
     mock_agent.session_total_tokens = 0
+    # Empty task-id marker keeps _reap_disconnected_agent_processes a no-op when
+    # an orphan-TTL cancel reaps this mock (a bare MagicMock marker would look
+    # like real process ownership and spawn a reaper thread).
+    mock_agent._gateway_turn_process_task_id = ""
 
     return mock_agent, ready, interrupted
 
@@ -1212,6 +1223,213 @@ class TestRunLifecycleSweep:
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
+
+
+class TestOrphanedRunTTL:
+    """#t_3d185287: live runs no client is watching are cancelled after
+    ``_RUN_ORPHAN_TTL`` seconds without contact.
+
+    A latency-probe orphan held the gateway at its concurrency cap for 49
+    minutes after the client timed out: no /stop ever arrived, no SSE
+    subscriber remained, and the run kept occupying an executor thread and a
+    concurrency slot. The sweep's orphan pass now cancels such runs through
+    the cooperative /stop contract (stopping → bounded hard interrupt →
+    run.cancelled → retire), while every client-contact surface (SSE
+    attach/detach, status poll, admission) refreshes the orphan clock.
+    """
+
+    @staticmethod
+    async def _wait_retired(adapter, run_id, timeout=5.0):
+        deadline = time.time() + timeout
+        while run_id in adapter._active_run_tasks and time.time() < deadline:
+            await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_orphaned_live_run_cancelled_after_ttl(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+                # Admission counts as client contact.
+                assert run_id in adapter._run_client_seen
+
+                # No SSE subscriber; age the contact clock past the TTL and sweep.
+                adapter._run_client_seen[run_id] -= adapter._RUN_ORPHAN_TTL + 1
+                adapter._sweep_orphaned_runs_once(time.time())
+
+                # Cooperative /stop contract, synchronously on the sweep:
+                # stopping status + stopping-set membership.
+                assert run_id in adapter._stopping_run_ids
+                assert adapter._run_statuses[run_id]["status"] == "stopping"
+                assert adapter._run_statuses[run_id]["last_event"] == "run.stopping"
+
+                # The daemon-thread hard interrupt reaches the agent with the
+                # bounded compression-fence wait (a wedged SessionDB commit
+                # must not pin the reclaim — the 2026-09-28 liveness incident).
+                assert interrupted.wait(timeout=5.0)
+                call = mock_agent.interrupt.call_args
+                assert "orphan TTL" in call.args[0]
+                assert call.kwargs["tool_reason"] == "orphaned run ttl"
+                assert call.kwargs["commit_fence_wait_s"] == (
+                    _ORPHAN_CANCEL_COMMIT_FENCE_WAIT_S
+                )
+
+                # The turn unwinds as cancelled and the run retires, freeing
+                # the concurrency slot and every control-plane table.
+                await self._wait_retired(adapter, run_id)
+                assert run_id not in adapter._active_run_tasks
+                assert run_id not in adapter._active_run_agents
+                assert run_id not in adapter._stopping_run_ids
+                assert run_id not in adapter._run_client_seen
+                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_live_sse_subscriber_shields_run(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                events_task = asyncio.ensure_future(
+                    cli.get(f"/v1/runs/{run_id}/events"))
+                await asyncio.sleep(0.2)  # let the SSE handler attach
+
+                adapter._run_client_seen[run_id] -= adapter._RUN_ORPHAN_TTL + 1
+                adapter._sweep_orphaned_runs_once(time.time())
+
+                # A live SSE audience is never an orphan, however old the clock.
+                assert run_id not in adapter._stopping_run_ids
+                assert run_id in adapter._active_run_tasks
+                assert adapter._run_statuses[run_id]["status"] != "stopping"
+
+                await cli.post(f"/v1/runs/{run_id}/stop")
+                events_resp = await asyncio.wait_for(events_task, timeout=5.0)
+                assert events_resp.status == 200
+                await events_resp.text()  # drain until the server closes the stream
+                await self._wait_retired(adapter, run_id)
+
+    @pytest.mark.asyncio
+    async def test_status_poll_refreshes_contact_clock(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                # Room-dispatch peers poll GET status instead of holding SSE.
+                adapter._run_client_seen[run_id] -= adapter._RUN_ORPHAN_TTL + 1
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                assert status_resp.status == 200
+                assert time.time() - adapter._run_client_seen[run_id] < 5.0
+
+                adapter._sweep_orphaned_runs_once(time.time())
+                assert run_id not in adapter._stopping_run_ids
+                assert run_id in adapter._active_run_tasks
+
+                await cli.post(f"/v1/runs/{run_id}/stop")
+                await self._wait_retired(adapter, run_id)
+
+    @pytest.mark.asyncio
+    async def test_sse_detach_refreshes_contact_clock(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                assert events_resp.status == 200
+                adapter._run_client_seen[run_id] -= adapter._RUN_ORPHAN_TTL + 1
+
+                # Client disconnect: the handler's finally detaches and starts
+                # the orphan clock fresh, so a reconnecting client gets the
+                # full TTL (aiohttp cancels the handler on connection loss).
+                events_resp.close()
+                deadline = time.time() + 5.0
+                while time.time() - adapter._run_client_seen.get(run_id, 0.0) >= 5.0:
+                    if time.time() >= deadline:
+                        pytest.fail("SSE detach never refreshed the orphan clock")
+                    await asyncio.sleep(0.05)
+
+                adapter._sweep_orphaned_runs_once(time.time())
+                assert run_id not in adapter._stopping_run_ids
+                assert run_id in adapter._active_run_tasks
+
+                await cli.post(f"/v1/runs/{run_id}/stop")
+                await self._wait_retired(adapter, run_id)
+
+    @pytest.mark.asyncio
+    async def test_zero_ttl_disables_orphan_pass(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                adapter._RUN_ORPHAN_TTL = 0  # instance override; <= 0 disables
+                adapter._run_client_seen[run_id] -= 10**6
+                adapter._sweep_orphaned_runs_once(time.time())
+                assert run_id not in adapter._stopping_run_ids
+                assert run_id in adapter._active_run_tasks
+
+                await cli.post(f"/v1/runs/{run_id}/stop")
+                await self._wait_retired(adapter, run_id)
+
+    def test_orphan_pass_skips_conservatively(self, adapter):
+        """Sync invariants of _sweep_orphaned_live_runs: done tasks, terminal
+        statuses, and live tasks with NO contact clock are never cancelled."""
+        from types import SimpleNamespace
+
+        live = SimpleNamespace(done=lambda: False)
+
+        # Live task without a contact clock (anomalous) → conservative skip.
+        adapter._active_run_tasks["run_noclock"] = live
+        adapter._run_statuses["run_noclock"] = {"status": "running"}
+        adapter._run_client_seen.pop("run_noclock", None)
+
+        # Done task with an ancient clock → skip (retirement owns it).
+        adapter._active_run_tasks["run_done"] = SimpleNamespace(done=lambda: True)
+        adapter._run_client_seen["run_done"] = 0.0
+
+        # Terminal status with an ancient clock → skip.
+        adapter._active_run_tasks["run_terminal"] = live
+        adapter._run_statuses["run_terminal"] = {
+            "status": "cancelled", "updated_at": time.time(),
+        }
+        adapter._run_client_seen["run_terminal"] = 0.0
+
+        try:
+            acted = _sweep_orphaned_live_runs(adapter, time.time())
+            assert acted == []
+            assert not adapter._stopping_run_ids
+        finally:
+            for rid in ("run_noclock", "run_done", "run_terminal"):
+                adapter._active_run_tasks.pop(rid, None)
+                adapter._run_statuses.pop(rid, None)
+                adapter._run_client_seen.pop(rid, None)
 
 
 # ---------------------------------------------------------------------------

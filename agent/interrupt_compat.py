@@ -24,6 +24,7 @@ def request_hard_interrupt(
     message: str | None = None,
     *,
     tool_reason: str | None = None,
+    commit_fence_wait_s: float | None = None,
 ) -> bool:
     """Request an explicit stop, falling back to the legacy interrupt ABI.
 
@@ -31,7 +32,10 @@ def request_hard_interrupt(
     doubles may only expose ``interrupt(message=None)`` and must not receive keyword
     arguments they do not know. ``tool_reason`` is a trusted, fixed category that may be
     exposed in model-visible tool cancellation output, forwarded only when the callable
-    explicitly supports it. Returns ``False`` only when neither callable is available.
+    explicitly supports it. ``commit_fence_wait_s`` (#t_3d185287) bounds the in-flight
+    compression-commit wait inside ``interrupt()`` and is forwarded the same way — callers
+    that cannot afford an unbounded block (gateway sweeps) pass it. Returns ``False`` only
+    when neither callable is available.
     """
     # Static lookup first: a dynamic ``__getattr__`` proxy (unspecced MagicMock, RPC
     # facade) must not be treated as genuinely implementing the new ABI.
@@ -48,6 +52,8 @@ def request_hard_interrupt(
     kwargs = {}
     if tool_reason is not None and _accepts_keyword(interrupt, "tool_reason"):
         kwargs["tool_reason"] = tool_reason
+    if commit_fence_wait_s is not None and _accepts_keyword(interrupt, "commit_fence_wait_s"):
+        kwargs["commit_fence_wait_s"] = commit_fence_wait_s
     if message is None:
         interrupt(**kwargs)
     else:
