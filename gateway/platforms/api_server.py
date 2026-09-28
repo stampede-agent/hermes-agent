@@ -4317,6 +4317,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    # Orphan TTL (#t_3d185287): a live run with no SSE subscriber and no owning-client contact
+    # (status poll / steer / stop / approval / events attach-detach) for this many seconds is
+    # cancelled via run.cancelled and its processes reaped. Clients that vanished without /stop
+    # (probe timeouts, crashed callers) otherwise pin the concurrency cap for the whole turn.
+    # <= 0 disables the pass.
+    _RUN_ORPHAN_TTL = 600
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         return _api_runs._set_run_status(self, run_id, status, **fields)
@@ -4371,10 +4377,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
 
     async def _sweep_orphaned_runs(self) -> None:
-        return await _api_runs._sweep_orphaned_runs(self)
+        return await _api_runs._sweep_orphaned_runs(self, _api_server=sys.modules[__name__])
 
     def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
-        return _api_runs._sweep_orphaned_runs_once(self, now)
+        return _api_runs._sweep_orphaned_runs_once(self, now, _api_server=sys.modules[__name__])
 
     # -- BasePlatformAdapter interface ------------------------------------------------
 

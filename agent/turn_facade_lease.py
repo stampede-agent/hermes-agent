@@ -44,6 +44,11 @@ class DurableTurnLease:
         self.interrupt_message: Optional[str] = None
         self.watchdog = None  # TurnLivenessWatchdog when configured
         self.timer_handles: list = []  # periodic_scheduler handles, cancelled in join_threads
+        # Bound on the abort interrupt's in-flight compression-commit fence wait; build_threads
+        # resolves the configured value (#t_3d185287).
+        from agent.turn_liveness import DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S
+
+        self.abort_commit_wait_s = DEFAULT_TURN_LIVENESS_ABORT_COMMIT_WAIT_S
 
     def _current_session_id(self) -> str:
         return getattr(self.agent, "session_id", None) or self.session_id
@@ -60,6 +65,7 @@ class DurableTurnLease:
         from agent import turn_liveness
 
         timeout_s, poll_s = turn_liveness.resolve_turn_liveness_settings(liveness_config)
+        self.abort_commit_wait_s = turn_liveness.resolve_liveness_abort_commit_wait_s(liveness_config)
         if timeout_s is not None:
             self.watchdog = turn_liveness.TurnLivenessWatchdog(
                 self.agent, session_id=self._current_session_id(), timeout_s=timeout_s,
@@ -145,9 +151,19 @@ class DurableTurnLease:
             if self.stop.is_set() or not self.turn_active:
                 return False
         try:
+            # Legacy agent doubles may not accept the bound kwarg; pass it only when the
+            # callable actually supports it (#t_3d185287). Bounded so a SessionDB-wedged
+            # compression commit cannot pin the abort for tens of minutes: on expiry the
+            # interrupt publishes without cancelling the commit — the turn unwinds when the
+            # commit completes, and stop_refresher lets TTL reclaim the session either way.
+            from agent.interrupt_compat import _accepts_keyword
+
+            interrupt_kwargs: Dict[str, Any] = {}
+            if _accepts_keyword(getattr(agent, "interrupt", None), "commit_fence_wait_s"):
+                interrupt_kwargs["commit_fence_wait_s"] = self.abort_commit_wait_s
             published = agent.interrupt(
                 message, hard_cancel=True, tool_reason="turn liveness watchdog",
-                require_generation=current_generation,
+                require_generation=current_generation, **interrupt_kwargs,
             )
         except Exception:
             logger.debug("Turn liveness abort interrupt raised; declining the abort", exc_info=True)

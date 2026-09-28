@@ -26,9 +26,15 @@ except ImportError:
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+from agent.interrupt_compat import request_hard_interrupt
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
+
+# Bounded in-flight compression-commit fence wait for orphan-TTL cancels (#t_3d185287): the
+# cancel's daemon thread must not be pinned by a SessionDB-wedged commit — the same failure
+# mode that held the turn-liveness abort for ~35 min on 2026-09-28.
+_ORPHAN_CANCEL_COMMIT_FENCE_WAIT_S = 60.0
 
 # Executor-thread lifetime for API-server agent turns (#116535). The handler-side
 # ``_inflight_agent_runs`` count in api_server.py drops in the handler's ``finally`` when the
@@ -229,6 +235,11 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
     ) = ({} for _ in range(7))
+    # Orphan-TTL client-contact clock (#t_3d185287), keyed by run_id -> wall-clock seconds of the
+    # last owning-client contact (admission, events attach/detach, status poll, steer, stop,
+    # approval). NOT an ownership-liveness table (see _release_run_owner_if_forgotten); entries
+    # are dropped by _retire_live_run when the run's task finishes.
+    self._run_client_seen: Dict[str, float] = {}
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -527,7 +538,7 @@ def _forget_run(self, run_id: str, *tables) -> None:
 def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids, self._shutdown_interrupted_run_ids)
+                self._stopping_run_ids, self._shutdown_interrupted_run_ids, self._run_client_seen)
 
 
 def _drop_run_transport(self, run_id: str) -> None:
@@ -718,6 +729,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
     q = self._run_streams[run_id] = _RunStream()
     created_at = self._run_streams_created[run_id] = time.time()
+    self._run_client_seen[run_id] = created_at  # admission counts as client contact (#t_3d185287)
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
         run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
@@ -729,7 +741,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         if outcome != "created":
             _forget_run(
                 self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
-                self._run_statuses, self._run_owners)
+                self._run_statuses, self._run_owners, self._run_client_seen)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
     launch = _RunLaunch(
@@ -1091,6 +1103,12 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
         status = self._set_run_status(run_id, "running")
     if status is None:
         return run_id, None, agent, task, _run_not_found(_openai_error, run_id)
+    if agent is not None or task is not None:
+        # Owned control/status traffic is client contact for the orphan TTL (#t_3d185287):
+        # room-dispatch peers poll GET status (<=2s cadence) instead of holding SSE, and a
+        # polling client must never have its live run orphan-cancelled. Terminal runs get no
+        # entry — the clock only matters while a task is live.
+        self._run_client_seen[run_id] = time.time()
     return run_id, status, agent, task, None
 
 
@@ -1127,6 +1145,8 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
     except (TypeError, ValueError):
         last_seq = -1
     q, replay = stream.attach(last_seq)
+    # An attaching SSE client is proof of life for the orphan TTL (#t_3d185287).
+    self._run_client_seen[run_id] = time.time()
     response = web.StreamResponse(status=200, headers=self._sse_headers(request))
 
     async def _write(data: bytes) -> None:
@@ -1189,6 +1209,11 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
         logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
     finally:
         stream.detach(q)
+        # Detach starts the orphan clock fresh (#t_3d185287): a reconnecting client gets the
+        # full TTL to re-attach. Gated on a live task so a post-retire detach cannot leave a
+        # dangling entry (the run is gone from every other table at that point).
+        if run_id in self._active_run_tasks:
+            self._run_client_seen[run_id] = time.time()
         self._release_run_owner_if_forgotten(run_id)
     return response
 
@@ -1314,15 +1339,90 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
     return web.json_response({"run_id": run_id, "status": "stopping"})
 
 
-async def _sweep_orphaned_runs(self) -> None:
+async def _sweep_orphaned_runs(self, *, _api_server=None) -> None:
     """Periodically expire transport buffers and terminal status records."""
     while True:
         await asyncio.sleep(60)
-        self._sweep_orphaned_runs_once(time.time())
+        self._sweep_orphaned_runs_once(time.time(), _api_server=_api_server)
 
 
-def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
-    """Expire old SSE buffers without treating transport age as run age."""
+def _cancel_orphaned_run(self, run_id: str, *, _api_server=None) -> None:
+    """Cancel one orphaned run (#t_3d185287): sync half on the event loop, blocking half threaded.
+
+    Mirrors the cooperative /stop contract so the run ends in ``run.cancelled`` through the
+    normal ``_finish`` path: status -> stopping, ``_stopping_run_ids`` membership (live-owner
+    runs poll it via ``should_stop``), and — for local-agent runs — a hard interrupt plus a
+    reap of the run's background processes. Both potentially-blocking halves run on a daemon
+    thread so neither the event loop nor the sweep can be pinned, and the interrupt itself
+    bounds its in-flight compression-commit fence wait: a wedged SessionDB commit must not
+    delay the reclaim any further (the 2026-09-28 liveness incident).
+    """
+    self._set_run_status(run_id, "stopping", last_event="run.stopping")
+    self._stopping_run_ids.add(run_id)
+    agent = self._active_run_agents.get(run_id)
+    if agent is None:
+        return  # live-owner run: the stopping set alone drives should_stop -> cancelled
+    reap = getattr(_api_server, "_reap_disconnected_agent_processes", None) if _api_server else None
+
+    def _interrupt_and_reap() -> None:
+        with suppress(Exception):
+            request_hard_interrupt(
+                agent,
+                "Run cancelled: client disconnected and did not reconnect within the orphan TTL",
+                tool_reason="orphaned run ttl",
+                commit_fence_wait_s=_ORPHAN_CANCEL_COMMIT_FENCE_WAIT_S,
+            )
+        if reap is not None:
+            with suppress(Exception):
+                reap(agent, source="api_server_run_orphan_ttl")
+
+    threading.Thread(
+        target=_interrupt_and_reap, name=f"run-orphan-cancel-{run_id[:16]}", daemon=True,
+    ).start()
+
+
+def _sweep_orphaned_live_runs(self, now: float, *, _api_server=None) -> list:
+    """Orphan-TTL pass (#t_3d185287): cancel non-terminal runs no client is watching.
+
+    A run is orphaned when it has no live SSE subscriber AND no owning-client contact
+    (events attach/detach, status poll, steer, stop, approval — all of which refresh
+    ``_run_client_seen``) for ``_RUN_ORPHAN_TTL`` seconds. This bounds the fallout of
+    clients that vanish without /stop (a latency-probe orphan held the gateway at its
+    concurrency cap for 49 minutes after the client timed out). Room-dispatch peers poll
+    status at <=2s cadence, so a live dispatcher never orphans its own run. The whole pass
+    runs synchronously on the event loop, so an SSE re-attach cannot interleave between
+    orphan detection and the stopping mark. Returns the acted-on run ids (tests).
+    """
+    ttl = float(getattr(self, "_RUN_ORPHAN_TTL", 0) or 0)
+    if ttl <= 0:
+        return []
+    cancelled: list = []
+    for run_id, task in list(self._active_run_tasks.items()):
+        if task.done():
+            continue
+        status = self._run_statuses.get(run_id) or {}
+        if status.get("status") in TERMINAL_STATUSES:
+            continue
+        stream = self._run_streams.get(run_id)
+        if stream is not None and stream.subscribers:
+            continue  # live SSE audience — not an orphan
+        last_seen = self._run_client_seen.get(run_id)
+        if last_seen is None:
+            continue  # no clock (anomalous for a live task); stay conservative
+        orphaned_for = now - last_seen
+        if orphaned_for < ttl:
+            continue
+        cancelled.append(run_id)
+        logger.warning(
+            "[api_server] cancelling orphaned run %s: no client contact for %.0fs (orphan TTL %.0fs)",
+            run_id, orphaned_for, ttl)
+        _cancel_orphaned_run(self, run_id, _api_server=_api_server)
+    return cancelled
+
+
+def _sweep_orphaned_runs_once(self, now: Optional[float] = None, *, _api_server=None) -> None:
+    """Expire old SSE buffers without treating transport age as run age, then cancel runs
+    orphaned past the client-contact TTL (#t_3d185287)."""
     if now is None:
         now = time.time()
     for run_id, created_at in list(self._run_streams_created.items()):
@@ -1336,6 +1436,7 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         if task is None or task.done():
             _unregister_approval_notify(self._run_approval_sessions.get(run_id))
             _retire_live_run(self, run_id)
+    _sweep_orphaned_live_runs(self, now, _api_server=_api_server)
     for run_id, status in list(self._run_statuses.items()):
         if (status.get("status") in {"completed", "failed", "cancelled"}
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
