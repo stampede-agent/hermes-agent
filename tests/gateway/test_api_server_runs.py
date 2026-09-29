@@ -1166,8 +1166,18 @@ class TestSteerRun:
 class TestRunLifecycleSweep:
 
     @pytest.mark.asyncio
-    async def test_expired_live_run_drops_transport_but_keeps_control_state(self, adapter):
-        """Stream TTL bounds buffering without detaching a live run."""
+    async def test_live_run_keeps_transport_past_stream_ttl(self, adapter):
+        """Stream TTL never tears down a still-running run's transport.
+
+        The backlog is already bounded (``_RunStream.BACKLOG_LIMIT``) and subscriber queues
+        self-clean on detach, so age-since-creation buys nothing while the task is genuinely
+        still executing (long tool chain, slow context compression) — it previously only meant
+        a reconnect after the 5-minute mark (same device after a background gap, or a second
+        device — iPhone/Mac/Live Activity — attaching for the first time) 404'd on /events with
+        "Run not found" even though GET /v1/runs/{id} correctly still said "running". Root cause
+        fixed 2026-09-28 (kanban run_c32d2c65...): the sweep now skips the transport drop for any
+        run whose task is not yet done.
+        """
         app = _create_runs_app(adapter)
         adapter._max_concurrent_runs = 1
 
@@ -1204,8 +1214,9 @@ class TestRunLifecycleSweep:
 
                 assert adapter._active_run_tasks[run_id] is task
                 assert adapter._active_run_agents[run_id] is mock_agent
-                assert run_id not in adapter._run_streams
-                assert run_id not in adapter._run_streams_created
+                # Transport survives: a reconnect (any device) must not 404.
+                assert run_id in adapter._run_streams
+                assert run_id in adapter._run_streams_created
                 assert adapter._run_approval_sessions[run_id] == run_id
 
                 limited = adapter._concurrency_limited_response()

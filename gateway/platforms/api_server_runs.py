@@ -1429,10 +1429,21 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None, *, _api_server=
         now = time.time()
     for run_id, created_at in list(self._run_streams_created.items()):
         stream = self._run_streams.get(run_id)
-        if now - created_at <= self._RUN_STREAM_TTL or (stream is not None and stream.subscribers):
+        task = self._active_run_tasks.get(run_id)
+        # The backlog itself is already bounded (``_RunStream.BACKLOG_LIMIT``) and subscriber
+        # queues self-clean on detach, so age-since-creation buys nothing for a task that is
+        # still genuinely running (long tool chain, slow context compression) — it only means
+        # any reconnect after the 5-minute mark (same device after a background gap, or a
+        # second device — iPhone/Mac/Live Activity — attaching for the first time) 404s on
+        # /events with "Run not found" even though GET /v1/runs/{id} correctly still says
+        # "running" (root cause, kanban 2026-09-28: run_c32d2c65...). Keep the transport alive
+        # for as long as the task is; a genuinely abandoned run is still bounded below by
+        # ``_RUN_ORPHAN_TTL``/``_sweep_orphaned_live_runs``, which cancels it and makes
+        # ``task.done()`` true, so this cannot leak an unbounded number of live entries.
+        if (now - created_at <= self._RUN_STREAM_TTL or (stream is not None and stream.subscribers)
+                or (task is not None and not task.done())):
             continue
         logger.debug("[api_server] sweeping expired run transport %s", run_id)
-        task = self._active_run_tasks.get(run_id)
         # Transport TTL bounds buffering; live control state survives until the task returns.
         _drop_run_transport(self, run_id)
         if task is None or task.done():
